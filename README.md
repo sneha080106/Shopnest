@@ -214,7 +214,7 @@ cp ../.env.example .env
 | `JWT_SECRET` | A long random string used to sign auth tokens. **Required** — the app refuses to start without it |
 | `JWT_EXPIRES_IN` | Token lifetime (default `7d`) |
 | `EMAIL_HOST` / `EMAIL_PORT` / `EMAIL_USER` / `EMAIL_PASSWORD` / `EMAIL_FROM` | SMTP settings for order confirmation and password-reset emails |
-| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Credentials for the admin account created by the seed script |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Credentials for the admin account created by the seed script. `ADMIN_PASSWORD` is **required** outside local development (see "Seeding the database") |
 | `RATE_LIMIT_WINDOW_MINUTES` / `RATE_LIMIT_AUTH_MAX` / `RATE_LIMIT_PAYMENT_MAX` | Optional — override the default rate limits on auth/payment endpoints |
 
 **Never commit your real `.env` file.** `.gitignore` already excludes it.
@@ -238,8 +238,16 @@ npm run seed          # insert 41 products + create the admin account
 npm run seed:destroy   # wipe seed-managed data
 ```
 
-Creates an admin account using `ADMIN_EMAIL`/`ADMIN_PASSWORD` from `.env` (defaults:
-`admin@shopnest.example.com` / `Admin@12345`).
+Creates an admin account using `ADMIN_EMAIL`/`ADMIN_PASSWORD` from `.env`.
+
+- Outside an explicit `NODE_ENV=development` or `test` (that includes `production` and an unset
+  `NODE_ENV`), `ADMIN_PASSWORD` is **required** and must be strong: at least 12 characters with
+  upper-case, lower-case, a digit and a symbol, and no common words or sequences. The seed aborts
+  with a clear error, before connecting to the database, if it is missing or weak.
+- In `development`/`test` against a local MongoDB only, a missing `ADMIN_PASSWORD` falls back to a
+  development-only default and prints a warning. That fallback is never used for any other
+  environment or for a non-local database.
+- Passwords are never printed by the seed script.
 
 ## Running the app
 

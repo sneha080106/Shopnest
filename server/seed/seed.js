@@ -8,11 +8,23 @@ const Order = require('../models/Order');
 const Cart = require('../models/Cart');
 const Review = require('../models/Review');
 const seedProducts = require('./products');
+const { resolveAdminPassword, AdminSeedConfigError } = require('../utils/adminSeedConfig');
 
 async function run() {
-  await connectDB();
-
   const destroy = process.argv.includes('-d');
+
+  // Validate admin credentials before touching the database, so a missing or weak
+  // ADMIN_PASSWORD aborts the seed without having connected or deleted anything.
+  let adminPassword;
+  if (!destroy) {
+    const resolved = resolveAdminPassword(process.env);
+    adminPassword = resolved.password;
+    if (resolved.source === 'dev-default') {
+      console.warn('WARNING: ADMIN_PASSWORD is not set; using the development-only default admin password against a local database. Never use this outside local development.');
+    }
+  }
+
+  await connectDB();
 
   if (destroy) {
     await Promise.all([
@@ -38,7 +50,6 @@ async function run() {
   console.log(`Seeded ${withSlugs.length} products.`);
 
   const adminEmail = process.env.ADMIN_EMAIL || 'admin@shopnest.example.com';
-  const adminPassword = process.env.ADMIN_PASSWORD || 'Admin@12345';
   const existingAdmin = await User.findOne({ email: adminEmail });
   if (!existingAdmin) {
     await User.create({
@@ -47,7 +58,7 @@ async function run() {
       password: adminPassword,
       role: 'admin'
     });
-    console.log(`Admin account created: ${adminEmail} / (password from .env)`);
+    console.log(`Admin account created: ${adminEmail}`);
   } else {
     console.log('Admin account already exists, skipping.');
   }
@@ -58,6 +69,10 @@ async function run() {
 }
 
 run().catch(err => {
-  console.error('Seeding failed:', err);
+  if (err instanceof AdminSeedConfigError) {
+    console.error(`Seeding aborted: ${err.message}`);
+  } else {
+    console.error('Seeding failed:', err);
+  }
   process.exit(1);
 });
