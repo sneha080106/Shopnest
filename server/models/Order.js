@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { ALL_METHODS } = require('../utils/paymentConstants');
 
 const orderItemSchema = new mongoose.Schema({
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
@@ -33,8 +34,17 @@ const orderSchema = new mongoose.Schema({
   discount: { type: Number, required: true, default: 0 },
   deliveryFee: { type: Number, required: true, default: 0 },
   total: { type: Number, required: true },
-  paymentMethod: { type: String, enum: ['Demo UPI', 'Demo Card', 'Cash on Delivery'], required: true },
+  paymentMethod: { type: String, enum: ALL_METHODS, required: true },
+  // Only ever set by the server. 'Paid' requires a verified Payment record (see orderController).
   paymentStatus: { type: String, enum: ['Pending', 'Paid', 'Failed'], default: 'Pending' },
+  // The verified Payment this order was paid with. Absent for Cash on Delivery. The unique sparse
+  // index below means one payment can never back two orders, even if application checks are bypassed.
+  payment: { type: mongoose.Schema.Types.ObjectId, ref: 'Payment' },
+  // Copy of the Payment's server-issued reference, for display and support lookups.
+  transactionId: { type: String },
+  // True while payments come from the demo simulator: 'Paid' then means "simulated", not real money.
+  paymentSimulated: { type: Boolean },
+  paidAt: { type: Date },
   orderStatus: {
     type: String,
     enum: ['Placed', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'],
@@ -45,6 +55,7 @@ const orderSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 // Supports "my orders, newest first" (getMyOrders) and admin's per-status listing.
+orderSchema.index({ payment: 1 }, { unique: true, sparse: true });
 orderSchema.index({ user: 1, createdAt: -1 });
 orderSchema.index({ orderStatus: 1, createdAt: -1 });
 

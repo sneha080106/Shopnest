@@ -1,10 +1,13 @@
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const User = require('../models/User');
+const Payment = require('../models/Payment');
 const { getOrCreateCart, populateCart } = require('./cartController');
 const sendEmail = require('../utils/sendEmail');
 const orderEmailTemplate = require('../utils/orderEmailTemplate');
 const { calculateOrderTotals } = require('../utils/pricing');
+const { cartFingerprint } = require('../utils/cartFingerprint');
+const { COD_METHOD, ALL_METHODS } = require('../utils/paymentConstants');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
 
@@ -47,29 +50,80 @@ async function rollbackReservedStock(reservedItems) {
   );
 }
 
+// ---- Payment verification -------------------------------------------------------------------------
+// A client-supplied transactionId (or payment status) is never proof of payment. The only accepted
+// evidence is a Payment record that WE created, for THIS user, THIS method, THIS amount and THIS
+// cart, that has not already been used for another order. Today those records come from the demo
+// simulator, so "verified" means "the simulator accepted it", not that real money moved.
+
+// Returns an AppError describing why `payment` can't back this order, or null if it can.
+function checkPaymentUsable(payment, { method, total, cartHash }) {
+  if (payment.method !== method) {
+    return new AppError('Payment method does not match the payment that was made', 400);
+  }
+  if (payment.status === 'Failed') return new AppError('Payment was not completed', 400);
+  if (payment.status === 'Consumed') return new AppError('This payment has already been used for an order', 400);
+  if (payment.expiresAt && new Date(payment.expiresAt).getTime() <= Date.now()) {
+    return new AppError('This payment session has expired. Please pay again.', 400);
+  }
+  if (payment.amount !== total || payment.cartHash !== cartHash) {
+    // 409 so the client sends the user back to review the cart, same as a price change.
+    return new AppError('Your cart changed after payment was made. Please review your cart and pay again.', 409);
+  }
+  return null;
+}
+
+// Atomically marks a Succeeded, unexpired payment as Consumed. Only one concurrent request can win;
+// the others get null.
+function claimPayment(paymentId, userId) {
+  return Payment.findOneAndUpdate(
+    { _id: paymentId, user: userId, status: 'Succeeded', expiresAt: { $gt: new Date() } },
+    { $set: { status: 'Consumed', consumedAt: new Date() } },
+    { new: true }
+  );
+}
+
+// Puts a claimed payment back to Succeeded when the order it was claimed for could not be created,
+// so the customer can retry without paying again. Never touches a payment that has an order.
+async function releasePayment(payment) {
+  if (!payment) return;
+  try {
+    await Payment.updateOne(
+      { _id: payment._id, status: 'Consumed', order: null },
+      { $set: { status: 'Succeeded' }, $unset: { consumedAt: 1 } }
+    );
+  } catch (err) {
+    console.error(`[order] Could not release payment ${payment.reference}: ${err.message}`);
+  }
+}
+
+// If an order already exists for this checkout attempt, answer with it (idempotent retry).
+async function replayIfOrderExists(res, clientRequestId, userId) {
+  if (!clientRequestId) return false;
+  const existing = await Order.findOne({ clientRequestId, user: userId });
+  if (!existing) return false;
+  res.status(200).json({ success: true, order: existing, emailSent: existing.emailSent, replay: true });
+  return true;
+}
+
 const createOrder = asyncHandler(async (req, res, next) => {
   const { addressId, paymentMethod, transactionId, clientRequestId, expectedTotal } = req.body;
-  const validMethods = ['Demo UPI', 'Demo Card', 'Cash on Delivery'];
 
   if (!addressId || !paymentMethod) {
     return next(new AppError('Address and payment method are required', 400));
   }
-  if (!validMethods.includes(paymentMethod)) {
+  if (!ALL_METHODS.includes(paymentMethod)) {
     return next(new AppError('Invalid payment method', 400));
   }
-  if (paymentMethod !== 'Cash on Delivery' && !transactionId) {
+  // transactionId must be a plain string (an object like { $ne: null } must never reach a query).
+  if (paymentMethod !== COD_METHOD && (typeof transactionId !== 'string' || transactionId.trim() === '')) {
     return next(new AppError('Payment was not completed', 400));
   }
 
   // Idempotency: a retried "Pay & Place Order" click (double click, a request that succeeded
   // server-side but the response never reached the client) reuses the same clientRequestId.
   // If we already created an order for it, hand back that order instead of billing twice.
-  if (clientRequestId) {
-    const existing = await Order.findOne({ clientRequestId, user: req.user._id });
-    if (existing) {
-      return res.status(200).json({ success: true, order: existing, emailSent: existing.emailSent, replay: true });
-    }
-  }
+  if (await replayIfOrderExists(res, clientRequestId, req.user._id)) return;
 
   const user = await User.findById(req.user._id);
   const address = user.addresses.id(addressId);
@@ -105,10 +159,36 @@ const createOrder = asyncHandler(async (req, res, next) => {
     });
   }
 
+  // Online payment: look the payment up in OUR records and make sure it really covers this order
+  // (same user, method, server-calculated total and cart). COD has no payment step to verify.
+  let payment = null;
+  if (paymentMethod !== COD_METHOD) {
+    const cartHash = cartFingerprint(
+      orderItems.map(i => ({ product: i.product, variant: i.variant, quantity: i.quantity, price: i.price }))
+    );
+    const found = await Payment.findOne({ reference: transactionId, user: req.user._id });
+    if (!found) {
+      return next(new AppError('Payment could not be verified. Please pay again.', 400));
+    }
+    // A retry of an order that already succeeded: the payment is "used", but by this very attempt.
+    if (found.status === 'Consumed' && await replayIfOrderExists(res, clientRequestId, req.user._id)) return;
+
+    const problem = checkPaymentUsable(found, { method: paymentMethod, total: totals.total, cartHash });
+    if (problem) return next(problem);
+
+    payment = await claimPayment(found._id, req.user._id);
+    if (!payment) {
+      // Lost a race: another request claimed this payment between our check and now.
+      if (await replayIfOrderExists(res, clientRequestId, req.user._id)) return;
+      return next(new AppError('This payment has already been used for an order', 400));
+    }
+  }
+
   let reserved;
   try {
     reserved = await reserveStock(orderItems);
   } catch (err) {
+    await releasePayment(payment); // let the customer retry (e.g. after a restock) without paying again
     return next(err);
   }
 
@@ -134,28 +214,49 @@ const createOrder = asyncHandler(async (req, res, next) => {
       },
       ...totals,
       paymentMethod,
-      paymentStatus: paymentMethod === 'Cash on Delivery' ? 'Pending' : 'Paid',
+      // Decided only here, from the verified Payment record - never from anything in the request.
+      paymentStatus: payment ? 'Paid' : 'Pending',
+      ...(payment && {
+        payment: payment._id,
+        transactionId: payment.reference,
+        paymentSimulated: payment.simulated,
+        paidAt: new Date()
+      }),
       orderStatus: 'Placed',
       estimatedDelivery
     });
   } catch (err) {
-    // A duplicate clientRequestId slipping past the check above (two identical requests racing
-    // each other) hits the unique index here instead — put the reserved stock back and return
-    // whichever order actually won the race, rather than erroring out on a request that in
-    // spirit already succeeded.
-    if (err.code === 11000 && err.keyPattern?.clientRequestId) {
-      await rollbackReservedStock(reserved);
-      const winner = await Order.findOne({ clientRequestId, user: req.user._id });
-      return res.status(200).json({ success: true, order: winner, emailSent: winner.emailSent, replay: true });
-    }
+    // Whatever went wrong, put the reserved stock back first so nothing stays decremented.
     await rollbackReservedStock(reserved);
+    // A duplicate clientRequestId slipping past the check above (two identical requests racing
+    // each other) hits the unique index here instead — return whichever order actually won the
+    // race, rather than erroring out on a request that in spirit already succeeded.
+    if (err.code === 11000 && err.keyPattern?.clientRequestId) {
+      await releasePayment(payment);
+      if (await replayIfOrderExists(res, clientRequestId, req.user._id)) return;
+    }
+    // The unique index on Order.payment says this payment already backs another order. It is
+    // legitimately used, so it is NOT released.
+    if (err.code === 11000 && err.keyPattern?.payment) {
+      return next(new AppError('This payment has already been used for an order', 400));
+    }
+    await releasePayment(payment);
     throw err;
+  }
+
+  if (payment) {
+    try {
+      await Payment.updateOne({ _id: payment._id }, { $set: { order: order._id } });
+    } catch (err) {
+      // Non-fatal: Order.payment is the authoritative link and the payment stays Consumed.
+      console.error(`[order] Could not link payment ${payment.reference} to ${order.orderNumber}: ${err.message}`);
+    }
   }
 
   cart.items = [];
   await cart.save();
 
-  console.log(`[order] Created ${order.orderNumber} for user ${req.user._id} — total ₹${order.total}, payment: ${paymentMethod}`);
+  console.log(`[order] Created ${order.orderNumber} for user ${req.user._id} — total ₹${order.total}, payment: ${paymentMethod}${payment ? ' (simulated)' : ''}`);
 
   const emailResult = await sendEmail({
     to: user.email,

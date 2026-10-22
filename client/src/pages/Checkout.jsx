@@ -61,7 +61,9 @@ export default function Checkout() {
         const payRes = await api.post('/payment/demo', {
           method: paymentMethod,
           upiId: paymentMethod === 'Demo UPI' ? upiId : undefined,
-          card: paymentMethod === 'Demo Card' ? card : undefined
+          card: paymentMethod === 'Demo Card' ? card : undefined,
+          // Same id as the order request, so a retried checkout reuses the payment it already made.
+          clientRequestId: clientRequestIdRef.current
         });
         transactionId = payRes.data.transactionId;
       }

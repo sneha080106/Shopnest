@@ -1,0 +1,1682 @@
+diff --git a/README.md b/README.md
+index ed823e9..bb73def 100644
+--- a/README.md
++++ b/README.md
+@@ -126,15 +126,32 @@ bugs live.
+ ## Demo payment
+ 
+ Checkout never contacts a real payment processor — this is explicit by design, not a shortcut.
++**Nothing about this flow is production payment processing.** It is a simulator, built so that a
++real gateway can later replace the simulator without changing how orders are verified.
+ 
+ - **Demo UPI** — any fake UPI ID in the form `name@upi`
+ - **Demo Card** — must use the fixed test card `4111 1111 1111 1111`, any future expiry (e.g.
+   `12/30`), any 3–4 digit CVV
+ - **Cash on Delivery** — no payment details required
+ 
+-"Pay & Place Order" simulates a ~1.2 second processing delay, then returns a transaction id. No
+-card number, CVV, or UPI ID is ever persisted anywhere — the payment endpoint only validates the
+-input and returns a reference id; it never reaches the database. The checkout screen is clearly
++How it works:
++
++1. `POST /api/payment/demo` calculates the amount **on the server** from the user's cart (same
++   pricing code as checkout; the request cannot set an amount or a status) and stores a `Payment`
++   record: user, amount, currency, method, status, and a hash of the cart that was paid for. The
++   record is marked `simulated: true`. A failed attempt is stored as `Failed` with a static reason —
++   card numbers, CVVs and UPI IDs are never stored.
++2. It returns the record's server-issued reference as `transactionId`.
++3. `POST /api/orders` does **not** trust that value as proof of anything. It looks the reference up
++   in the `Payment` records and only accepts a payment that belongs to the same user, used the same
++   method, `Succeeded`, hasn't expired (15 minutes) or been used, and whose amount and cart hash
++   match the order being placed now. The payment is claimed atomically, so it can back at most one
++   order (a unique index on `Order.payment` backs this up). If stock can't be reserved, the claim is
++   released so the customer can retry without paying again.
++4. The order stores the payment link, the reference and `paymentSimulated: true`. `paymentStatus`
++   is set only by the server, never from the request.
++
++"Pay & Place Order" simulates a ~1.2 second processing delay. The checkout screen is clearly
+ labeled **"DEMO PAYMENT — NO REAL MONEY WILL BE CHARGED."**
+ 
+ ## Security measures
+diff --git a/client/src/pages/Checkout.jsx b/client/src/pages/Checkout.jsx
+index 8fde9bb..5e3f124 100644
+--- a/client/src/pages/Checkout.jsx
++++ b/client/src/pages/Checkout.jsx
+@@ -61,7 +61,9 @@ export default function Checkout() {
+         const payRes = await api.post('/payment/demo', {
+           method: paymentMethod,
+           upiId: paymentMethod === 'Demo UPI' ? upiId : undefined,
+-          card: paymentMethod === 'Demo Card' ? card : undefined
++          card: paymentMethod === 'Demo Card' ? card : undefined,
++          // Same id as the order request, so a retried checkout reuses the payment it already made.
++          clientRequestId: clientRequestIdRef.current
+         });
+         transactionId = payRes.data.transactionId;
+       }
+diff --git a/server/controllers/orderController.js b/server/controllers/orderController.js
+index 8ea9656..1f1d76c 100644
+--- a/server/controllers/orderController.js
++++ b/server/controllers/orderController.js
+@@ -1,10 +1,13 @@
+ const Order = require('../models/Order');
+ const Product = require('../models/Product');
+ const User = require('../models/User');
++const Payment = require('../models/Payment');
+ const { getOrCreateCart, populateCart } = require('./cartController');
+ const sendEmail = require('../utils/sendEmail');
+ const orderEmailTemplate = require('../utils/orderEmailTemplate');
+ const { calculateOrderTotals } = require('../utils/pricing');
++const { cartFingerprint } = require('../utils/cartFingerprint');
++const { COD_METHOD, ALL_METHODS } = require('../utils/paymentConstants');
+ const AppError = require('../utils/AppError');
+ const asyncHandler = require('../middleware/asyncHandler');
+ 
+@@ -47,29 +50,80 @@ async function rollbackReservedStock(reservedItems) {
+   );
+ }
+ 
++// ---- Payment verification -------------------------------------------------------------------------
++// A client-supplied transactionId (or payment status) is never proof of payment. The only accepted
++// evidence is a Payment record that WE created, for THIS user, THIS method, THIS amount and THIS
++// cart, that has not already been used for another order. Today those records come from the demo
++// simulator, so "verified" means "the simulator accepted it", not that real money moved.
++
++// Returns an AppError describing why `payment` can't back this order, or null if it can.
++function checkPaymentUsable(payment, { method, total, cartHash }) {
++  if (payment.method !== method) {
++    return new AppError('Payment method does not match the payment that was made', 400);
++  }
++  if (payment.status === 'Failed') return new AppError('Payment was not completed', 400);
++  if (payment.status === 'Consumed') return new AppError('This payment has already been used for an order', 400);
++  if (payment.expiresAt && new Date(payment.expiresAt).getTime() <= Date.now()) {
++    return new AppError('This payment session has expired. Please pay again.', 400);
++  }
++  if (payment.amount !== total || payment.cartHash !== cartHash) {
++    // 409 so the client sends the user back to review the cart, same as a price change.
++    return new AppError('Your cart changed after payment was made. Please review your cart and pay again.', 409);
++  }
++  return null;
++}
++
++// Atomically marks a Succeeded, unexpired payment as Consumed. Only one concurrent request can win;
++// the others get null.
++function claimPayment(paymentId, userId) {
++  return Payment.findOneAndUpdate(
++    { _id: paymentId, user: userId, status: 'Succeeded', expiresAt: { $gt: new Date() } },
++    { $set: { status: 'Consumed', consumedAt: new Date() } },
++    { new: true }
++  );
++}
++
++// Puts a claimed payment back to Succeeded when the order it was claimed for could not be created,
++// so the customer can retry without paying again. Never touches a payment that has an order.
++async function releasePayment(payment) {
++  if (!payment) return;
++  try {
++    await Payment.updateOne(
++      { _id: payment._id, status: 'Consumed', order: null },
++      { $set: { status: 'Succeeded' }, $unset: { consumedAt: 1 } }
++    );
++  } catch (err) {
++    console.error(`[order] Could not release payment ${payment.reference}: ${err.message}`);
++  }
++}
++
++// If an order already exists for this checkout attempt, answer with it (idempotent retry).
++async function replayIfOrderExists(res, clientRequestId, userId) {
++  if (!clientRequestId) return false;
++  const existing = await Order.findOne({ clientRequestId, user: userId });
++  if (!existing) return false;
++  res.status(200).json({ success: true, order: existing, emailSent: existing.emailSent, replay: true });
++  return true;
++}
++
+ const createOrder = asyncHandler(async (req, res, next) => {
+   const { addressId, paymentMethod, transactionId, clientRequestId, expectedTotal } = req.body;
+-  const validMethods = ['Demo UPI', 'Demo Card', 'Cash on Delivery'];
+ 
+   if (!addressId || !paymentMethod) {
+     return next(new AppError('Address and payment method are required', 400));
+   }
+-  if (!validMethods.includes(paymentMethod)) {
++  if (!ALL_METHODS.includes(paymentMethod)) {
+     return next(new AppError('Invalid payment method', 400));
+   }
+-  if (paymentMethod !== 'Cash on Delivery' && !transactionId) {
++  // transactionId must be a plain string (an object like { $ne: null } must never reach a query).
++  if (paymentMethod !== COD_METHOD && (typeof transactionId !== 'string' || transactionId.trim() === '')) {
+     return next(new AppError('Payment was not completed', 400));
+   }
+ 
+   // Idempotency: a retried "Pay & Place Order" click (double click, a request that succeeded
+   // server-side but the response never reached the client) reuses the same clientRequestId.
+   // If we already created an order for it, hand back that order instead of billing twice.
+-  if (clientRequestId) {
+-    const existing = await Order.findOne({ clientRequestId, user: req.user._id });
+-    if (existing) {
+-      return res.status(200).json({ success: true, order: existing, emailSent: existing.emailSent, replay: true });
+-    }
+-  }
++  if (await replayIfOrderExists(res, clientRequestId, req.user._id)) return;
+ 
+   const user = await User.findById(req.user._id);
+   const address = user.addresses.id(addressId);
+@@ -105,10 +159,36 @@ const createOrder = asyncHandler(async (req, res, next) => {
+     });
+   }
+ 
++  // Online payment: look the payment up in OUR records and make sure it really covers this order
++  // (same user, method, server-calculated total and cart). COD has no payment step to verify.
++  let payment = null;
++  if (paymentMethod !== COD_METHOD) {
++    const cartHash = cartFingerprint(
++      orderItems.map(i => ({ product: i.product, variant: i.variant, quantity: i.quantity, price: i.price }))
++    );
++    const found = await Payment.findOne({ reference: transactionId, user: req.user._id });
++    if (!found) {
++      return next(new AppError('Payment could not be verified. Please pay again.', 400));
++    }
++    // A retry of an order that already succeeded: the payment is "used", but by this very attempt.
++    if (found.status === 'Consumed' && await replayIfOrderExists(res, clientRequestId, req.user._id)) return;
++
++    const problem = checkPaymentUsable(found, { method: paymentMethod, total: totals.total, cartHash });
++    if (problem) return next(problem);
++
++    payment = await claimPayment(found._id, req.user._id);
++    if (!payment) {
++      // Lost a race: another request claimed this payment between our check and now.
++      if (await replayIfOrderExists(res, clientRequestId, req.user._id)) return;
++      return next(new AppError('This payment has already been used for an order', 400));
++    }
++  }
++
+   let reserved;
+   try {
+     reserved = await reserveStock(orderItems);
+   } catch (err) {
++    await releasePayment(payment); // let the customer retry (e.g. after a restock) without paying again
+     return next(err);
+   }
+ 
+@@ -134,28 +214,49 @@ const createOrder = asyncHandler(async (req, res, next) => {
+       },
+       ...totals,
+       paymentMethod,
+-      paymentStatus: paymentMethod === 'Cash on Delivery' ? 'Pending' : 'Paid',
++      // Decided only here, from the verified Payment record - never from anything in the request.
++      paymentStatus: payment ? 'Paid' : 'Pending',
++      ...(payment && {
++        payment: payment._id,
++        transactionId: payment.reference,
++        paymentSimulated: payment.simulated,
++        paidAt: new Date()
++      }),
+       orderStatus: 'Placed',
+       estimatedDelivery
+     });
+   } catch (err) {
++    // Whatever went wrong, put the reserved stock back first so nothing stays decremented.
++    await rollbackReservedStock(reserved);
+     // A duplicate clientRequestId slipping past the check above (two identical requests racing
+-    // each other) hits the unique index here instead — put the reserved stock back and return
+-    // whichever order actually won the race, rather than erroring out on a request that in
+-    // spirit already succeeded.
++    // each other) hits the unique index here instead — return whichever order actually won the
++    // race, rather than erroring out on a request that in spirit already succeeded.
+     if (err.code === 11000 && err.keyPattern?.clientRequestId) {
+-      await rollbackReservedStock(reserved);
+-      const winner = await Order.findOne({ clientRequestId, user: req.user._id });
+-      return res.status(200).json({ success: true, order: winner, emailSent: winner.emailSent, replay: true });
++      await releasePayment(payment);
++      if (await replayIfOrderExists(res, clientRequestId, req.user._id)) return;
+     }
+-    await rollbackReservedStock(reserved);
++    // The unique index on Order.payment says this payment already backs another order. It is
++    // legitimately used, so it is NOT released.
++    if (err.code === 11000 && err.keyPattern?.payment) {
++      return next(new AppError('This payment has already been used for an order', 400));
++    }
++    await releasePayment(payment);
+     throw err;
+   }
+ 
++  if (payment) {
++    try {
++      await Payment.updateOne({ _id: payment._id }, { $set: { order: order._id } });
++    } catch (err) {
++      // Non-fatal: Order.payment is the authoritative link and the payment stays Consumed.
++      console.error(`[order] Could not link payment ${payment.reference} to ${order.orderNumber}: ${err.message}`);
++    }
++  }
++
+   cart.items = [];
+   await cart.save();
+ 
+-  console.log(`[order] Created ${order.orderNumber} for user ${req.user._id} — total ₹${order.total}, payment: ${paymentMethod}`);
++  console.log(`[order] Created ${order.orderNumber} for user ${req.user._id} — total ₹${order.total}, payment: ${paymentMethod}${payment ? ' (simulated)' : ''}`);
+ 
+   const emailResult = await sendEmail({
+     to: user.email,
+diff --git a/server/controllers/paymentController.js b/server/controllers/paymentController.js
+index 53aa8ce..1e837da 100644
+--- a/server/controllers/paymentController.js
++++ b/server/controllers/paymentController.js
+@@ -1,41 +1,147 @@
++const crypto = require('crypto');
+ const AppError = require('../utils/AppError');
+ const asyncHandler = require('../middleware/asyncHandler');
++const Payment = require('../models/Payment');
++const { getOrCreateCart, populateCart } = require('./cartController');
++const { cartFingerprint } = require('../utils/cartFingerprint');
++const { COD_METHOD, ALL_METHODS, PAYMENT_TTL_MS } = require('../utils/paymentConstants');
+ 
+-// Demo payment simulator. No real payment gateway is contacted.
+-// Card numbers are only ever validated against the fixed demo value below.
++// DEMO payment simulator. No real payment gateway is contacted and no money moves.
++// What it does do is create a server-side Payment record - for the amount the SERVER calculated
++// from the user's cart - that order creation later verifies. A "Succeeded" record from this
++// endpoint only means "the simulator accepted the fake details"; it is never proof of a real
++// payment, and the record says so (simulated: true).
++//
++// Card numbers are only ever compared against the fixed demo value below and are never stored.
+ const DEMO_CARD_NUMBER = '4111111111111111';
+ 
+-const simulatePayment = asyncHandler(async (req, res, next) => {
+-  const { method, card, upiId } = req.body;
+-  const validMethods = ['Demo UPI', 'Demo Card', 'Cash on Delivery'];
+-  if (!validMethods.includes(method)) {
+-    return next(new AppError('Invalid payment method', 400));
+-  }
+-
++function validateDemoDetails(method, { card, upiId }) {
+   if (method === 'Demo Card') {
+-    const cleaned = (card?.number || '').replace(/\s/g, '');
++    const cleaned = String(card?.number ?? '').replace(/\s/g, '');
+     if (cleaned !== DEMO_CARD_NUMBER) {
+-      return next(new AppError('Invalid demo card. Use 4111 1111 1111 1111.', 400));
++      return { code: 'invalid_card', message: 'Invalid demo card. Use 4111 1111 1111 1111.' };
+     }
+     if (!card?.expiry || !card?.cvv || !card?.name) {
+-      return next(new AppError('Please fill in all card details', 400));
++      return { code: 'incomplete_card', message: 'Please fill in all card details' };
+     }
+-    if (!/^\d{3,4}$/.test(card.cvv)) {
+-      return next(new AppError('CVV must be 3 or 4 digits', 400));
++    if (!/^\d{3,4}$/.test(String(card.cvv))) {
++      return { code: 'invalid_cvv', message: 'CVV must be 3 or 4 digits' };
+     }
+   }
+-
+   if (method === 'Demo UPI') {
+-    if (!upiId || !upiId.includes('@')) {
+-      return next(new AppError('Please enter a valid demo UPI ID (e.g. name@upi)', 400));
++    if (typeof upiId !== 'string' || !upiId.includes('@')) {
++      return { code: 'invalid_upi', message: 'Please enter a valid demo UPI ID (e.g. name@upi)' };
++    }
++  }
++  return null;
++}
++
++function newReference() {
++  return `DEMO-${crypto.randomBytes(12).toString('hex')}`;
++}
++
++function paymentResponse(payment, extra = {}) {
++  return {
++    success: true,
++    // Kept under this name for API compatibility; the client sends it back to POST /orders, where
++    // it is only ever looked up in our own Payment records.
++    transactionId: payment.reference,
++    paymentId: payment._id,
++    // 'Paid' here means "the simulator accepted it" - see `simulated`.
++    status: 'Paid',
++    amount: payment.amount,
++    currency: payment.currency,
++    simulated: true,
++    note: 'Simulated payment - no real money was charged.',
++    ...extra
++  };
++}
++
++const simulatePayment = asyncHandler(async (req, res, next) => {
++  // Only these fields are read. Anything else the client sends (amount, status, user, ...) is ignored.
++  const { method, card, upiId } = req.body;
++  const requestId = typeof req.body.clientRequestId === 'string' && req.body.clientRequestId.length <= 100
++    ? req.body.clientRequestId
++    : undefined;
++
++  if (!ALL_METHODS.includes(method)) {
++    return next(new AppError('Invalid payment method', 400));
++  }
++
++  // Cash on Delivery has no online payment step: no record, nothing to verify later.
++  if (method === COD_METHOD) {
++    return res.json({
++      success: true,
++      status: 'Pending',
++      simulated: true,
++      message: 'No online payment is needed for Cash on Delivery.'
++    });
++  }
++
++  // Retry after the order already went through (e.g. the response was lost): the cart is empty by
++  // now, but this checkout attempt's payment exists and is already attached to an order. Hand it
++  // back so the client's follow-up POST /orders can return that original order.
++  if (requestId) {
++    const used = await Payment.findOne({ user: req.user._id, clientRequestId: requestId, method, status: 'Consumed' });
++    if (used) return res.json(paymentResponse(used, { replay: true }));
++  }
++
++  // The amount comes from the database cart and the shared pricing code - never from the request.
++  const cart = await getOrCreateCart(req.user._id);
++  const populated = await populateCart(cart);
++  if (populated.items.length === 0) {
++    return next(new AppError('Your cart is empty', 400));
++  }
++  const amount = populated.total;
++  const cartHash = cartFingerprint(
++    populated.items.map(i => ({ product: i.product._id, variant: i.variant, quantity: i.quantity, price: i.product.price }))
++  );
++
++  const failure = validateDemoDetails(method, { card, upiId });
++  if (failure) {
++    // Keep a record of the failed attempt (static reason code only - no card or UPI details).
++    try {
++      await Payment.create({
++        user: req.user._id,
++        amount,
++        method,
++        status: 'Failed',
++        reference: newReference(),
++        cartHash,
++        clientRequestId: requestId,
++        failureReason: failure.code
++      });
++    } catch (err) {
++      console.warn(`[payment] Could not record failed attempt: ${err.message}`);
+     }
++    return next(new AppError(failure.message, 400));
++  }
++
++  // Retry safety: if this checkout attempt already has an unused successful payment for the same
++  // method, amount and cart, hand that one back instead of creating a second payment.
++  if (requestId) {
++    const existing = await Payment.findOne({
++      user: req.user._id, clientRequestId: requestId, method, amount, cartHash,
++      status: 'Succeeded', expiresAt: { $gt: new Date() }
++    });
++    if (existing) return res.json(paymentResponse(existing, { replay: true }));
+   }
+ 
+   // Simulate processing delay
+   await new Promise(resolve => setTimeout(resolve, 1200));
+ 
+-  const transactionId = `TXN${Date.now()}${Math.floor(Math.random() * 1000)}`;
+-  res.json({ success: true, transactionId, status: method === 'Cash on Delivery' ? 'Pending' : 'Paid' });
++  const payment = await Payment.create({
++    user: req.user._id,
++    amount,
++    method,
++    status: 'Succeeded',
++    reference: newReference(),
++    cartHash,
++    clientRequestId: requestId,
++    expiresAt: new Date(Date.now() + PAYMENT_TTL_MS)
++  });
++
++  res.json(paymentResponse(payment));
+ });
+ 
+ module.exports = { simulatePayment };
+diff --git a/server/models/Order.js b/server/models/Order.js
+index e19d1f3..fc6c619 100644
+--- a/server/models/Order.js
++++ b/server/models/Order.js
+@@ -1,4 +1,5 @@
+ const mongoose = require('mongoose');
++const { ALL_METHODS } = require('../utils/paymentConstants');
+ 
+ const orderItemSchema = new mongoose.Schema({
+   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
+@@ -33,8 +34,17 @@ const orderSchema = new mongoose.Schema({
+   discount: { type: Number, required: true, default: 0 },
+   deliveryFee: { type: Number, required: true, default: 0 },
+   total: { type: Number, required: true },
+-  paymentMethod: { type: String, enum: ['Demo UPI', 'Demo Card', 'Cash on Delivery'], required: true },
++  paymentMethod: { type: String, enum: ALL_METHODS, required: true },
++  // Only ever set by the server. 'Paid' requires a verified Payment record (see orderController).
+   paymentStatus: { type: String, enum: ['Pending', 'Paid', 'Failed'], default: 'Pending' },
++  // The verified Payment this order was paid with. Absent for Cash on Delivery. The unique sparse
++  // index below means one payment can never back two orders, even if application checks are bypassed.
++  payment: { type: mongoose.Schema.Types.ObjectId, ref: 'Payment' },
++  // Copy of the Payment's server-issued reference, for display and support lookups.
++  transactionId: { type: String },
++  // True while payments come from the demo simulator: 'Paid' then means "simulated", not real money.
++  paymentSimulated: { type: Boolean },
++  paidAt: { type: Date },
+   orderStatus: {
+     type: String,
+     enum: ['Placed', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'],
+@@ -45,6 +55,7 @@ const orderSchema = new mongoose.Schema({
+ }, { timestamps: true });
+ 
+ // Supports "my orders, newest first" (getMyOrders) and admin's per-status listing.
++orderSchema.index({ payment: 1 }, { unique: true, sparse: true });
+ orderSchema.index({ user: 1, createdAt: -1 });
+ orderSchema.index({ orderStatus: 1, createdAt: -1 });
+ 
+diff --git a/server/models/Payment.js b/server/models/Payment.js
+new file mode 100644
+index 0000000..8f89e30
+--- /dev/null
++++ b/server/models/Payment.js
+@@ -0,0 +1,36 @@
++const mongoose = require('mongoose');
++const { ONLINE_METHODS, PAYMENT_STATUSES } = require('../utils/paymentConstants');
++
++// A server-side record of one payment attempt. This is the ONLY thing order creation accepts as
++// evidence that a payment happened - a client-supplied transaction id or status is never proof.
++//
++// Today every record is produced by the demo simulator (provider 'demo', simulated: true), so a
++// "Succeeded" record means "the simulator accepted the fake details", NOT that money moved.
++// A real gateway integration should create records here in a pending state, move them to
++// 'Succeeded' only from a server-side verification or a signed webhook, and set simulated: false.
++const paymentSchema = new mongoose.Schema({
++  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
++  // Set once the payment has been attached to an order.
++  order: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
++  // Server-calculated from the user's cart at payment time (same unit as Order.total, i.e. rupees).
++  amount: { type: Number, required: true, min: 0 },
++  currency: { type: String, required: true, default: 'INR' },
++  method: { type: String, enum: ONLINE_METHODS, required: true },
++  provider: { type: String, enum: ['demo'], required: true, default: 'demo' },
++  simulated: { type: Boolean, required: true, default: true },
++  status: { type: String, enum: PAYMENT_STATUSES, required: true },
++  // Server-issued, unguessable identifier. This is what clients send back as `transactionId`.
++  // A real gateway's payment id would be stored in a separate field next to it.
++  reference: { type: String, required: true, unique: true },
++  // Hash of the cart contents that were paid for, so the payment can't be reused for a different cart
++  // that happens to have the same total.
++  cartHash: { type: String, required: true },
++  // Lets a retried payment call for the same checkout attempt find the payment it already made.
++  clientRequestId: { type: String, index: true },
++  // A short static code only. Never card numbers, UPI ids or any other user-supplied payment detail.
++  failureReason: { type: String },
++  expiresAt: { type: Date },
++  consumedAt: { type: Date }
++}, { timestamps: true });
++
++module.exports = mongoose.model('Payment', paymentSchema);
+diff --git a/server/tests/integration/api.integration.test.js b/server/tests/integration/api.integration.test.js
+index ee25a09..d505dd9 100644
+--- a/server/tests/integration/api.integration.test.js
++++ b/server/tests/integration/api.integration.test.js
+@@ -25,6 +25,9 @@ describeIfDb('API integration', () => {
+   let request;
+   let User;
+   let Product;
++  let Order;
++  let Payment;
++  let Cart;
+ 
+   beforeAll(async () => {
+     process.env.MONGO_URI = TEST_URI;
+@@ -35,10 +38,17 @@ describeIfDb('API integration', () => {
+     app = require('../../server');
+     User = require('../../models/User');
+     Product = require('../../models/Product');
++    Order = require('../../models/Order');
++    Payment = require('../../models/Payment');
++    Cart = require('../../models/Cart');
++    // Make sure the unique indexes the payment checks rely on actually exist.
++    await Promise.all([Order.init(), Payment.init()]);
+   });
+ 
+   beforeEach(async () => {
+-    await Promise.all([User.deleteMany({}), Product.deleteMany({})]);
++    await Promise.all([
++      User.deleteMany({}), Product.deleteMany({}), Order.deleteMany({}), Payment.deleteMany({}), Cart.deleteMany({})
++    ]);
+   });
+ 
+   afterAll(async () => {
+@@ -102,6 +112,105 @@ describeIfDb('API integration', () => {
+     });
+   });
+ 
++  // NOTE: written to run against a real MongoDB (MONGO_URI_TEST). It could not be executed in the
++  // environment where it was authored (no MongoDB available), so treat the first run as unverified.
++  describe('checkout payment verification (demo payments)', () => {
++    const GOOD_CARD = { name: 'Sneha Rao', number: '4111 1111 1111 1111', expiry: '12/30', cvv: '123' };
++    let token;
++    let addressId;
++    let product;
++
++    async function api(method, url, body) {
++      const req = request(app)[method](url).set('Authorization', `Bearer ${token}`);
++      return body === undefined ? req : req.send(body);
++    }
++
++    beforeEach(async () => {
++      await request(app).post('/api/auth/register').send({
++        name: 'Sneha Rao', email: 'pay@example.com', password: 'password123', confirmPassword: 'password123'
++      });
++      token = (await request(app).post('/api/auth/login').send({ email: 'pay@example.com', password: 'password123' })).body.token;
++      const addr = await api('post', '/api/addresses', {
++        fullName: 'Sneha Rao', phone: '9999999999', houseNumber: '1', street: 'Main St', city: 'Pune', state: 'MH', pincode: '411001'
++      });
++      addressId = addr.body.addresses[0]._id;
++      product = await Product.create({
++        name: 'Widget', slug: 'widget', description: 'x', category: 'Electronics', brand: 'B',
++        price: 500, mrp: 600, images: ['x.jpg'], stock: 5
++      });
++      await api('post', '/api/cart', { productId: String(product._id), quantity: 2 }); // total 1000
++    });
++
++    test('an arbitrary transactionId cannot create a paid order', async () => {
++      const res = await api('post', '/api/orders', {
++        addressId, paymentMethod: 'Demo Card', transactionId: 'TXN-made-up', clientRequestId: 'bypass-1', paymentStatus: 'Paid'
++      });
++      expect(res.status).toBe(400);
++      expect(await Order.countDocuments()).toBe(0);
++      expect((await Product.findById(product._id)).stock).toBe(5);
++    });
++
++    test('pay then order: paid + simulated, payment linked, stock deducted once; payment cannot be reused', async () => {
++      const pay = await api('post', '/api/payment/demo', { method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'ok-1' });
++      expect(pay.status).toBe(200);
++      expect(pay.body.simulated).toBe(true);
++      expect(pay.body.amount).toBe(1000);
++
++      const order = await api('post', '/api/orders', {
++        addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId, clientRequestId: 'ok-1', expectedTotal: 1000
++      });
++      expect(order.status).toBe(201);
++      expect(order.body.order).toMatchObject({ paymentStatus: 'Paid', paymentSimulated: true, transactionId: pay.body.transactionId });
++      expect((await Product.findById(product._id)).stock).toBe(3);
++      const record = await Payment.findOne({ reference: pay.body.transactionId });
++      expect(record.status).toBe('Consumed');
++      expect(String(record.order)).toBe(String(order.body.order._id));
++
++      // same attempt retried -> original order, no second deduction
++      const retry = await api('post', '/api/orders', {
++        addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId, clientRequestId: 'ok-1'
++      });
++      expect(retry.status).toBe(200);
++      expect(retry.body.replay).toBe(true);
++      expect(await Order.countDocuments()).toBe(1);
++      expect((await Product.findById(product._id)).stock).toBe(3);
++
++      // a different attempt reusing the same payment is refused
++      await api('post', '/api/cart', { productId: String(product._id), quantity: 2 });
++      const reuse = await api('post', '/api/orders', {
++        addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId, clientRequestId: 'ok-2'
++      });
++      expect(reuse.status).toBe(400);
++      expect(await Order.countDocuments()).toBe(1);
++      expect((await Product.findById(product._id)).stock).toBe(3);
++    });
++
++    test('concurrent orders with one payment produce exactly one order', async () => {
++      const pay = await api('post', '/api/payment/demo', { method: 'Demo Card', card: GOOD_CARD });
++      const body = id => ({ addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId, clientRequestId: id });
++      const results = await Promise.all([api('post', '/api/orders', body('c1')), api('post', '/api/orders', body('c2'))]);
++      expect(results.filter(r => r.status === 201)).toHaveLength(1);
++      expect(await Order.countDocuments()).toBe(1);
++      expect((await Product.findById(product._id)).stock).toBe(3);
++    });
++
++    test('changing the cart after paying is rejected', async () => {
++      const pay = await api('post', '/api/payment/demo', { method: 'Demo Card', card: GOOD_CARD });
++      await api('post', '/api/cart', { productId: String(product._id), quantity: 1 }); // now 3 items
++      const res = await api('post', '/api/orders', { addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId });
++      expect(res.status).toBe(409);
++      expect(await Order.countDocuments()).toBe(0);
++    });
++
++    test('Cash on Delivery still works and stays Pending', async () => {
++      const res = await api('post', '/api/orders', { addressId, paymentMethod: 'Cash on Delivery', clientRequestId: 'cod-1', paymentStatus: 'Paid' });
++      expect(res.status).toBe(201);
++      expect(res.body.order.paymentStatus).toBe('Pending');
++      expect(res.body.order.payment).toBeUndefined();
++      expect((await Product.findById(product._id)).stock).toBe(3);
++    });
++  });
++
+   describe('authorization', () => {
+     test('a logged-in customer cannot reach admin routes', async () => {
+       await request(app).post('/api/auth/register').send({
+diff --git a/server/tests/unit/helpers/fakeModels.js b/server/tests/unit/helpers/fakeModels.js
+new file mode 100644
+index 0000000..7ff12ba
+--- /dev/null
++++ b/server/tests/unit/helpers/fakeModels.js
+@@ -0,0 +1,167 @@
++// A small stateful in-memory stand-in for the Mongoose models the order/payment controllers use.
++// It exists so the controllers' real logic (verification, atomic claim, stock reservation,
++// rollback, idempotency) can be exercised without a MongoDB server.
++//
++// What it is NOT: a MongoDB emulator. It implements only the query/update operators the controllers
++// use, and throws on anything else so a test can't silently pass on an unsupported operator.
++// Like MongoDB's single-document operations, each findOneAndUpdate/updateOne runs atomically
++// (no await between the match and the write), while awaits between calls let concurrent requests
++// interleave - which is what the double-spend tests rely on.
++
++const { calculateOrderTotals } = require('../../../utils/pricing');
++
++let seq = 0;
++const newId = () => `id${++seq}`;
++
++const store = { products: [], orders: [], payments: [], users: [], carts: [] };
++const hooks = { failOrderCreate: null };
++
++function reset() {
++  seq = 0;
++  Object.keys(store).forEach(k => { store[k].length = 0; });
++  hooks.failOrderCreate = null;
++}
++
++function matches(doc, filter) {
++  return Object.entries(filter).every(([key, cond]) => {
++    const value = doc[key];
++    if (cond !== null && typeof cond === 'object' && !(cond instanceof Date)) {
++      const ops = Object.keys(cond);
++      if (!ops.every(op => op.startsWith('$'))) {
++        throw new Error(`fakeModels: object used as a plain value for "${key}" (would be an operator injection in Mongo)`);
++      }
++      return ops.every(op => {
++        const operand = cond[op];
++        const num = x => (x instanceof Date ? x.getTime() : x);
++        if (op === '$gte') return num(value) >= num(operand);
++        if (op === '$gt') return value != null && num(value) > num(operand);
++        throw new Error(`fakeModels: unsupported operator ${op}`);
++      });
++    }
++    if (cond === null) return value == null;
++    return String(value) === String(cond);
++  });
++}
++
++function applyUpdate(doc, update) {
++  Object.entries(update.$inc || {}).forEach(([k, v]) => { doc[k] = (doc[k] || 0) + v; });
++  Object.entries(update.$set || {}).forEach(([k, v]) => { doc[k] = v; });
++  Object.keys(update.$unset || {}).forEach(k => { delete doc[k]; });
++  const known = new Set(['$inc', '$set', '$unset']);
++  Object.keys(update).forEach(op => { if (!known.has(op)) throw new Error(`fakeModels: unsupported update operator ${op}`); });
++}
++
++const copy = doc => (doc ? { ...doc } : null);
++
++const Product = {
++  findOneAndUpdate: async (filter, update) => {
++    const doc = store.products.find(d => matches(d, filter));
++    if (!doc) return null;
++    applyUpdate(doc, update);
++    return copy(doc);
++  },
++  findById: async id => copy(store.products.find(d => d._id === String(id))),
++  updateOne: async (filter, update) => {
++    const doc = store.products.find(d => matches(d, filter));
++    if (doc) applyUpdate(doc, update);
++    return { matchedCount: doc ? 1 : 0 };
++  }
++};
++
++function dupError(keyPattern) {
++  const err = new Error('E11000 duplicate key error');
++  err.code = 11000;
++  err.keyPattern = keyPattern;
++  err.keyValue = { ...keyPattern };
++  return err;
++}
++
++const Order = {
++  findOne: async filter => store.orders.find(d => matches(d, filter)) || null,
++  create: async doc => {
++    if (hooks.failOrderCreate) throw hooks.failOrderCreate;
++    if (doc.clientRequestId && store.orders.some(o => o.clientRequestId === doc.clientRequestId)) {
++      throw dupError({ clientRequestId: 1 });
++    }
++    if (doc.payment && store.orders.some(o => String(o.payment) === String(doc.payment))) {
++      throw dupError({ payment: 1 });
++    }
++    const order = { _id: newId(), emailSent: false, ...doc, async save() { return this; } };
++    store.orders.push(order);
++    return order;
++  }
++};
++
++const Payment = {
++  create: async doc => {
++    if (store.payments.some(p => p.reference === doc.reference)) throw dupError({ reference: 1 });
++    const payment = {
++      _id: newId(), order: null, currency: 'INR', provider: 'demo', simulated: true,
++      createdAt: new Date(), ...doc
++    };
++    store.payments.push(payment);
++    return copy(payment);
++  },
++  findOne: async filter => copy(store.payments.find(d => matches(d, filter))),
++  findOneAndUpdate: async (filter, update) => {
++    const doc = store.payments.find(d => matches(d, filter));
++    if (!doc) return null;
++    applyUpdate(doc, update);
++    return copy(doc);
++  },
++  updateOne: async (filter, update) => {
++    const doc = store.payments.find(d => matches(d, filter));
++    if (doc) applyUpdate(doc, update);
++    return { matchedCount: doc ? 1 : 0 };
++  }
++};
++
++const User = {
++  findById: async id => store.users.find(u => u._id === String(id)) || null
++};
++
++// Stand-in for controllers/cartController (same two functions, same return shape).
++const cartController = {
++  getOrCreateCart: async userId => {
++    let cart = store.carts.find(c => c.user === String(userId));
++    if (!cart) {
++      cart = { user: String(userId), items: [], async save() { return this; } };
++      store.carts.push(cart);
++    }
++    return cart;
++  },
++  populateCart: async cart => {
++    const items = cart.items
++      .map(i => ({ _id: i._id, quantity: i.quantity, variant: i.variant ?? null, product: store.products.find(p => p._id === i.product) }))
++      .filter(i => i.product);
++    const totals = calculateOrderTotals(items.map(i => ({ price: i.product.price, mrp: i.product.mrp, quantity: i.quantity })));
++    return { items, ...totals };
++  }
++};
++
++// ---- seeding helpers ----
++function seedProduct(overrides = {}) {
++  const product = {
++    _id: newId(), name: 'Test product', price: 500, mrp: 500, stock: 5, isActive: true, images: ['x.jpg'],
++    ...overrides
++  };
++  store.products.push(product);
++  return product;
++}
++
++function seedUser(overrides = {}) {
++  const id = overrides._id || newId();
++  const addr = { _id: `addr-${id}`, fullName: 'Test User', phone: '9999999999', houseNumber: '1', street: 'Main', city: 'Pune', state: 'MH', pincode: '411001', type: 'Home' };
++  const addresses = Object.assign([addr], { id: addrId => (String(addrId) === addr._id ? addr : null) });
++  const user = { _id: id, email: `${id}@example.com`, addresses, ...overrides };
++  store.users.push(user);
++  return { user, addressId: addr._id };
++}
++
++function setCart(userId, lines) {
++  const cart = store.carts.find(c => c.user === String(userId)) || (store.carts.push({ user: String(userId), items: [], async save() { return this; } }), store.carts[store.carts.length - 1]);
++  cart.items = lines.map(l => ({ _id: newId(), product: l.product._id || l.product, quantity: l.quantity, variant: l.variant ?? null }));
++  return cart;
++}
++
++module.exports = { store, hooks, reset, Product, Order, Payment, User, cartController, seedProduct, seedUser, setCart };
+diff --git a/server/tests/unit/orderPayment.test.js b/server/tests/unit/orderPayment.test.js
+new file mode 100644
+index 0000000..36c4a8f
+--- /dev/null
++++ b/server/tests/unit/orderPayment.test.js
+@@ -0,0 +1,428 @@
++// Order creation vs. payment verification. These run the real orderController and paymentController
++// against in-memory fakes of the models (see helpers/fakeModels.js), so they cover the controllers'
++// logic - verification, atomic claim, stock reservation/rollback, idempotency - but not MongoDB itself.
++// All payments here are from the DEMO simulator; "Paid" means "simulated", never real money.
++
++jest.mock('../../models/Order', () => require('./helpers/fakeModels').Order);
++jest.mock('../../models/Product', () => require('./helpers/fakeModels').Product);
++jest.mock('../../models/User', () => require('./helpers/fakeModels').User);
++jest.mock('../../models/Payment', () => require('./helpers/fakeModels').Payment);
++jest.mock('../../controllers/cartController', () => require('./helpers/fakeModels').cartController);
++jest.mock('../../utils/sendEmail', () => jest.fn(async () => ({ sent: false, error: 'email disabled in tests' })));
++jest.mock('../../utils/orderEmailTemplate', () => () => '<p>order</p>');
++
++const fake = require('./helpers/fakeModels');
++const { createOrder } = require('../../controllers/orderController');
++const { simulatePayment } = require('../../controllers/paymentController');
++
++const GOOD_CARD = { name: 'Sneha', number: '4111 1111 1111 1111', expiry: '12/30', cvv: '123' };
++
++let user; let addressId; let p1; let p2;
++
++beforeEach(() => {
++  jest.useFakeTimers();
++  jest.spyOn(console, 'log').mockImplementation(() => {});
++  jest.spyOn(console, 'warn').mockImplementation(() => {});
++  jest.spyOn(console, 'error').mockImplementation(() => {});
++  fake.reset();
++  ({ user, addressId } = fake.seedUser());
++  p1 = fake.seedProduct({ name: 'P1', price: 500, mrp: 600, stock: 5 });
++  p2 = fake.seedProduct({ name: 'P2', price: 500, mrp: 500, stock: 1 });
++  fake.setCart(user._id, [{ product: p1, quantity: 2 }]); // total 1000
++});
++
++afterEach(() => {
++  jest.useRealTimers();
++  jest.restoreAllMocks();
++});
++
++function makeRes() {
++  const res = { statusCode: 200 };
++  res.status = jest.fn(c => { res.statusCode = c; return res; });
++  res.json = jest.fn(b => { res.body = b; return res; });
++  return res;
++}
++
++async function pay(body = { method: 'Demo Card', card: GOOD_CARD }, asUser = user) {
++  const res = makeRes();
++  const next = jest.fn();
++  const pending = simulatePayment({ user: { _id: asUser._id }, body }, res, next);
++  await jest.advanceTimersByTimeAsync(1300);
++  await pending;
++  return { body: res.body, error: next.mock.calls[0]?.[0] };
++}
++
++// Returns what the client would see: { status, body } for a response, or { error } for next(err).
++async function placeOrder(body, asUser = user, asAddress = addressId) {
++  const res = makeRes();
++  const next = jest.fn();
++  await createOrder({ user: { _id: asUser._id }, body: { addressId: asAddress, ...body } }, res, next);
++  const error = next.mock.calls[0]?.[0];
++  return { status: error ? error.statusCode : res.statusCode, body: res.body, error };
++}
++
++const stockOf = product => fake.store.products.find(p => p._id === product._id).stock;
++const paymentOf = reference => fake.store.payments.find(p => p.reference === reference);
++
++describe('payment bypass attempts are rejected', () => {
++  test('an arbitrary transactionId is not proof of payment', async () => {
++    for (const fakeId of ['TXN123456', 'x', 'DEMO-aaaaaaaaaaaaaaaaaaaaaaaa']) {
++      const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: fakeId, clientRequestId: `req-${fakeId}` });
++      expect(r.error).toMatchObject({ statusCode: 400 });
++      expect(r.error.message).toMatch(/could not be verified/);
++    }
++    expect(fake.store.orders).toHaveLength(0);
++    expect(stockOf(p1)).toBe(5);
++  });
++
++  test('a transactionId that is an object/number (operator injection) never reaches a query', async () => {
++    const spy = jest.spyOn(fake.Payment, 'findOne');
++    for (const bad of [{ $ne: null }, { $gt: '' }, 12345, ['a'], true]) {
++      const r = await placeOrder({ paymentMethod: 'Demo UPI', transactionId: bad });
++      expect(r.error).toMatchObject({ statusCode: 400 });
++    }
++    expect(spy).not.toHaveBeenCalled();
++    expect(fake.store.orders).toHaveLength(0);
++  });
++
++  test('a missing or blank transactionId is rejected for online methods', async () => {
++    for (const t of [undefined, '', '   ']) {
++      const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: t });
++      expect(r.error).toMatchObject({ statusCode: 400, message: 'Payment was not completed' });
++    }
++    expect(fake.store.orders).toHaveLength(0);
++  });
++
++  test('the client cannot set paymentStatus (or any payment field) to Paid', async () => {
++    const r = await placeOrder({
++      paymentMethod: 'Demo Card', transactionId: 'whatever', paymentStatus: 'Paid',
++      status: 'Paid', paid: true, paymentSimulated: false, payment: 'id999', amount: 0
++    });
++    expect(r.error).toMatchObject({ statusCode: 400 });
++    expect(fake.store.orders).toHaveLength(0);
++  });
++
++  test('on a Cash on Delivery order, a client-sent paymentStatus: "Paid" is ignored', async () => {
++    const r = await placeOrder({ paymentMethod: 'Cash on Delivery', paymentStatus: 'Paid', paidAt: 'x', payment: 'id999' });
++    expect(r.status).toBe(201);
++    const order = fake.store.orders[0];
++    expect(order.paymentStatus).toBe('Pending');
++    expect(order.payment).toBeUndefined();
++    expect(order.paidAt).toBeUndefined();
++  });
++
++  test("another user's payment cannot be used", async () => {
++    const { user: other } = fake.seedUser();
++    fake.setCart(other._id, [{ product: p1, quantity: 2 }]);
++    const theirs = await pay(undefined, other);
++
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: theirs.body.transactionId });
++    expect(r.error).toMatchObject({ statusCode: 400 });
++    expect(fake.store.orders).toHaveLength(0);
++    expect(paymentOf(theirs.body.transactionId).status).toBe('Succeeded'); // theirs is untouched
++  });
++
++  test('a payment made with a different method cannot back this order', async () => {
++    const paid = await pay({ method: 'Demo UPI', upiId: 'a@upi' });
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId });
++    expect(r.error).toMatchObject({ statusCode: 400 });
++    expect(r.error.message).toMatch(/method does not match/);
++    expect(fake.store.orders).toHaveLength(0);
++    expect(paymentOf(paid.body.transactionId).status).toBe('Succeeded');
++  });
++});
++
++describe('failed payments do not produce paid orders', () => {
++  test('a Failed payment record cannot back an order', async () => {
++    const failed = await pay({ method: 'Demo Card', card: { ...GOOD_CARD, number: '4000 0000 0000 0002' } });
++    expect(failed.error).toMatchObject({ statusCode: 400 });
++    const record = fake.store.payments.find(p => p.status === 'Failed');
++    expect(record).toBeDefined();
++
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: record.reference });
++    expect(r.error).toMatchObject({ statusCode: 400, message: 'Payment was not completed' });
++    expect(fake.store.orders).toHaveLength(0);
++    expect(stockOf(p1)).toBe(5);
++    expect(record.status).toBe('Failed');
++  });
++
++  test('after a failed payment, going straight to /orders still creates nothing', async () => {
++    await pay({ method: 'Demo UPI', upiId: 'bad-upi' });
++    const r = await placeOrder({ paymentMethod: 'Demo UPI', transactionId: undefined });
++    expect(r.error).toMatchObject({ statusCode: 400 });
++    expect(fake.store.orders).toHaveLength(0);
++  });
++});
++
++describe('amount and cart must match what was paid', () => {
++  test('quantity increased after paying => rejected (409), nothing reserved, payment stays usable', async () => {
++    const paid = await pay();
++    fake.setCart(user._id, [{ product: p1, quantity: 3 }]); // now 1500
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId });
++    expect(r.error).toMatchObject({ statusCode: 409 });
++    expect(r.error.message).toMatch(/cart changed after payment/);
++    expect(fake.store.orders).toHaveLength(0);
++    expect(stockOf(p1)).toBe(5);
++    expect(paymentOf(paid.body.transactionId).status).toBe('Succeeded');
++  });
++
++  test('price changed after paying => rejected, even if the client claims the new total as expected', async () => {
++    const paid = await pay();
++    fake.store.products.find(p => p._id === p1._id).price = 900; // cart now 1800
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId, expectedTotal: 1800 });
++    expect(r.error).toMatchObject({ statusCode: 409 });
++    expect(fake.store.orders).toHaveLength(0);
++    expect(stockOf(p1)).toBe(5);
++  });
++
++  test('a different cart with the SAME total is rejected too (payment is bound to the cart)', async () => {
++    const other = fake.seedProduct({ name: 'Other', price: 500, mrp: 500, stock: 10 });
++    const paid = await pay(); // paid 1000 for 2 x P1
++    fake.setCart(user._id, [{ product: other, quantity: 2 }]); // also 1000
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId });
++    expect(r.error).toMatchObject({ statusCode: 409 });
++    expect(fake.store.orders).toHaveLength(0);
++    expect(stockOf(other)).toBe(10);
++  });
++
++  test('a payment that was too small cannot be topped up by a cheaper original cart being swapped', async () => {
++    const cheap = fake.seedProduct({ price: 100, mrp: 100, stock: 5 });
++    fake.setCart(user._id, [{ product: cheap, quantity: 1 }]); // 100 + 49 = 149
++    const paid = await pay();
++    expect(paid.body.amount).toBe(149);
++    fake.setCart(user._id, [{ product: p1, quantity: 2 }]); // 1000
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId });
++    expect(r.error).toMatchObject({ statusCode: 409 });
++    expect(fake.store.orders).toHaveLength(0);
++  });
++
++  test('an expectedTotal that no longer matches is still a 409 (existing behaviour kept)', async () => {
++    const paid = await pay();
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId, expectedTotal: 999 });
++    expect(r.status).toBe(409);
++    expect(r.body).toMatchObject({ success: false });
++    expect(fake.store.orders).toHaveLength(0);
++    expect(paymentOf(paid.body.transactionId).status).toBe('Succeeded');
++  });
++
++  test('an expired payment cannot be used', async () => {
++    const paid = await pay();
++    await jest.advanceTimersByTimeAsync(16 * 60 * 1000);
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId });
++    expect(r.error).toMatchObject({ statusCode: 400 });
++    expect(r.error.message).toMatch(/expired/);
++    expect(fake.store.orders).toHaveLength(0);
++    expect(stockOf(p1)).toBe(5);
++  });
++});
++
++describe('the verified happy path', () => {
++  test('pay then order: Paid + simulated, payment persisted and linked, stock deducted once, cart emptied', async () => {
++    const paid = await pay();
++    const r = await placeOrder({
++      paymentMethod: 'Demo Card', transactionId: paid.body.transactionId,
++      clientRequestId: 'req-1', expectedTotal: 1000
++    });
++    expect(r.status).toBe(201);
++    expect(r.body.success).toBe(true);
++
++    expect(fake.store.orders).toHaveLength(1);
++    const order = fake.store.orders[0];
++    const payment = paymentOf(paid.body.transactionId);
++    expect(order).toMatchObject({
++      paymentMethod: 'Demo Card', paymentStatus: 'Paid', paymentSimulated: true,
++      transactionId: paid.body.transactionId, payment: payment._id, total: 1000, orderStatus: 'Placed'
++    });
++    expect(order.paidAt).toBeInstanceOf(Date);
++    expect(payment).toMatchObject({ status: 'Consumed', order: order._id, amount: 1000 });
++    expect(payment.consumedAt).toBeInstanceOf(Date);
++    expect(stockOf(p1)).toBe(3);
++    expect(fake.store.carts.find(c => c.user === user._id).items).toHaveLength(0);
++  });
++
++  test('UPI works end to end as well', async () => {
++    const paid = await pay({ method: 'Demo UPI', upiId: 'sneha@upi' });
++    const r = await placeOrder({ paymentMethod: 'Demo UPI', transactionId: paid.body.transactionId, clientRequestId: 'req-upi' });
++    expect(r.status).toBe(201);
++    expect(fake.store.orders[0]).toMatchObject({ paymentMethod: 'Demo UPI', paymentStatus: 'Paid' });
++  });
++});
++
++describe('duplicate and repeated requests', () => {
++  test('a payment cannot back a second order', async () => {
++    const paid = await pay();
++    await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId, clientRequestId: 'req-1' });
++    expect(stockOf(p1)).toBe(3);
++
++    fake.setCart(user._id, [{ product: p1, quantity: 2 }]); // same cart again
++    const second = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId, clientRequestId: 'req-2' });
++    expect(second.error).toMatchObject({ statusCode: 400 });
++    expect(second.error.message).toMatch(/already been used/);
++    expect(fake.store.orders).toHaveLength(1);
++    expect(stockOf(p1)).toBe(3);
++  });
++
++  test('retrying the same clientRequestId returns the original order: one order, one stock deduction', async () => {
++    const paid = await pay();
++    const body = { paymentMethod: 'Demo Card', transactionId: paid.body.transactionId, clientRequestId: 'req-1', expectedTotal: 1000 };
++    const first = await placeOrder(body);
++    const retry = await placeOrder(body);
++    expect(first.status).toBe(201);
++    expect(retry.status).toBe(200);
++    expect(retry.body.replay).toBe(true);
++    expect(retry.body.order._id).toBe(first.body.order._id);
++    expect(fake.store.orders).toHaveLength(1);
++    expect(stockOf(p1)).toBe(3);
++  });
++
++  test('a retried payment + order for the same attempt yields one payment, one order, one deduction', async () => {
++    const attempt = { clientRequestId: 'req-flaky' };
++    const pay1 = await pay({ method: 'Demo Card', card: GOOD_CARD, ...attempt });
++    const order1 = await placeOrder({ paymentMethod: 'Demo Card', transactionId: pay1.body.transactionId, ...attempt });
++    // The response got lost; the client repeats both calls with the same attempt id.
++    const pay2 = await pay({ method: 'Demo Card', card: GOOD_CARD, ...attempt });
++    const order2 = await placeOrder({ paymentMethod: 'Demo Card', transactionId: pay2.body.transactionId, ...attempt });
++    expect(pay2.body.transactionId).toBe(pay1.body.transactionId);
++    expect(order2.body.order._id).toBe(order1.body.order._id);
++    expect(fake.store.payments).toHaveLength(1);
++    expect(fake.store.orders).toHaveLength(1);
++    expect(stockOf(p1)).toBe(3);
++  });
++
++  test('two concurrent requests, same clientRequestId and payment: one order, stock deducted once', async () => {
++    const paid = await pay();
++    const body = { paymentMethod: 'Demo Card', transactionId: paid.body.transactionId, clientRequestId: 'req-race' };
++    const results = await Promise.all([placeOrder(body), placeOrder(body)]);
++    expect(fake.store.orders).toHaveLength(1);
++    expect(stockOf(p1)).toBe(3);
++    expect(results.filter(r => r.status === 201)).toHaveLength(1);
++    results.filter(r => r.status !== 201).forEach(r => {
++      // the loser either gets the winner's order back or a clean "already used" error - never a second order
++      if (r.error) expect(r.error.statusCode).toBe(400);
++      else expect(r.body.order._id).toBe(fake.store.orders[0]._id);
++    });
++  });
++
++  test('two concurrent requests, different clientRequestIds, SAME payment: only one order (no double spend)', async () => {
++    const paid = await pay();
++    const mk = id => ({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId, clientRequestId: id });
++    const results = await Promise.all([placeOrder(mk('a')), placeOrder(mk('b')), placeOrder(mk('c'))]);
++    expect(fake.store.orders).toHaveLength(1);
++    expect(stockOf(p1)).toBe(3);
++    expect(results.filter(r => r.status === 201)).toHaveLength(1);
++    results.filter(r => r.status !== 201).forEach(r => expect(r.error).toMatchObject({ statusCode: 400 }));
++    expect(fake.store.payments.filter(p => p.status === 'Consumed')).toHaveLength(1);
++  });
++});
++
++describe('stock safety around payment', () => {
++  test('stock runs out after payment: order fails, nothing is deducted, payment is released and reusable', async () => {
++    const paid = await pay();
++    fake.store.products.find(p => p._id === p1._id).stock = 1; // someone else bought the rest
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId, clientRequestId: 'req-1' });
++    expect(r.error).toMatchObject({ statusCode: 400 });
++    expect(r.error.message).toMatch(/Only 1 left/);
++    expect(fake.store.orders).toHaveLength(0);
++    expect(stockOf(p1)).toBe(1);
++    expect(paymentOf(paid.body.transactionId)).toMatchObject({ status: 'Succeeded', order: null });
++    expect(paymentOf(paid.body.transactionId).consumedAt).toBeUndefined();
++
++    // restocked: the same payment now works, once
++    fake.store.products.find(p => p._id === p1._id).stock = 5;
++    const retry = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId, clientRequestId: 'req-1' });
++    expect(retry.status).toBe(201);
++    expect(stockOf(p1)).toBe(3);
++  });
++
++  test('multi-item cart where the second item is short: first item is rolled back, payment released', async () => {
++    fake.setCart(user._id, [{ product: p1, quantity: 2 }, { product: p2, quantity: 3 }]); // p2 only has 1
++    const paid = await pay();
++    const r = await placeOrder({ paymentMethod: 'Demo Card', transactionId: paid.body.transactionId });
++    expect(r.error).toMatchObject({ statusCode: 400 });
++    expect(stockOf(p1)).toBe(5);
++    expect(stockOf(p2)).toBe(1);
++    expect(fake.store.orders).toHaveLength(0);
++    expect(paymentOf(paid.body.transactionId).status).toBe('Succeeded');
++  });
++
++  test('Order.create failing after stock was reserved: stock restored, payment released, error surfaced', async () => {
++    const paid = await pay();
++    fake.hooks.failOrderCreate = new Error('database exploded');
++    const res = makeRes();
++    const next = jest.fn();
++    await createOrder(
++      { user: { _id: user._id }, body: { addressId, paymentMethod: 'Demo Card', transactionId: paid.body.transactionId } },
++      res, next
++    );
++    expect(next.mock.calls[0][0].message).toBe('database exploded');
++    expect(fake.store.orders).toHaveLength(0);
++    expect(stockOf(p1)).toBe(5);
++    expect(paymentOf(paid.body.transactionId)).toMatchObject({ status: 'Succeeded', order: null });
++  });
++
++  test('overselling is still prevented: two paid customers, one unit left', async () => {
++    const lastOne = fake.seedProduct({ name: 'Last one', price: 500, mrp: 500, stock: 1 });
++    const { user: u2, addressId: a2 } = fake.seedUser();
++    fake.setCart(user._id, [{ product: lastOne, quantity: 1 }]);
++    fake.setCart(u2._id, [{ product: lastOne, quantity: 1 }]);
++    const [pa, pb] = [await pay(), await pay(undefined, u2)];
++    const results = await Promise.all([
++      placeOrder({ paymentMethod: 'Demo Card', transactionId: pa.body.transactionId, clientRequestId: 'u1' }),
++      placeOrder({ paymentMethod: 'Demo Card', transactionId: pb.body.transactionId, clientRequestId: 'u2' }, u2, a2)
++    ]);
++    expect(results.filter(r => r.status === 201)).toHaveLength(1);
++    expect(stockOf(lastOne)).toBe(0);
++    expect(fake.store.orders).toHaveLength(1);
++    // the customer who lost keeps a usable (released) payment
++    const loserRef = results[0].status === 201 ? pb.body.transactionId : pa.body.transactionId;
++    expect(paymentOf(loserRef).status).toBe('Succeeded');
++  });
++});
++
++describe('Cash on Delivery keeps working', () => {
++  test('COD creates a Pending order, deducts stock, empties the cart, needs no payment record', async () => {
++    const r = await placeOrder({ paymentMethod: 'Cash on Delivery', clientRequestId: 'cod-1', expectedTotal: 1000 });
++    expect(r.status).toBe(201);
++    const order = fake.store.orders[0];
++    expect(order).toMatchObject({ paymentMethod: 'Cash on Delivery', paymentStatus: 'Pending', total: 1000 });
++    expect(order.payment).toBeUndefined();
++    expect(order.transactionId).toBeUndefined();
++    expect(fake.store.payments).toHaveLength(0);
++    expect(stockOf(p1)).toBe(3);
++    expect(fake.store.carts.find(c => c.user === user._id).items).toHaveLength(0);
++  });
++
++  test('COD ignores a garbage transactionId and never consumes anyone\'s payment', async () => {
++    const { user: other } = fake.seedUser();
++    fake.setCart(other._id, [{ product: p1, quantity: 2 }]);
++    const theirs = await pay(undefined, other);
++    const r = await placeOrder({ paymentMethod: 'Cash on Delivery', transactionId: theirs.body.transactionId });
++    expect(r.status).toBe(201);
++    expect(fake.store.orders[0].payment).toBeUndefined();
++    expect(paymentOf(theirs.body.transactionId).status).toBe('Succeeded');
++  });
++
++  test('COD retried with the same clientRequestId: one order, one deduction', async () => {
++    const body = { paymentMethod: 'Cash on Delivery', clientRequestId: 'cod-retry' };
++    const first = await placeOrder(body);
++    const second = await placeOrder(body);
++    expect(first.status).toBe(201);
++    expect(second.body.replay).toBe(true);
++    expect(fake.store.orders).toHaveLength(1);
++    expect(stockOf(p1)).toBe(3);
++  });
++
++  test('COD out of stock fails cleanly without touching stock', async () => {
++    fake.store.products.find(p => p._id === p1._id).stock = 1;
++    const r = await placeOrder({ paymentMethod: 'Cash on Delivery' });
++    expect(r.error).toMatchObject({ statusCode: 400 });
++    expect(stockOf(p1)).toBe(1);
++    expect(fake.store.orders).toHaveLength(0);
++  });
++
++  test('COD still needs an address and an empty cart is still rejected', async () => {
++    expect((await placeOrder({ paymentMethod: 'Cash on Delivery' }, user, null)).error).toMatchObject({ statusCode: 400 });
++    fake.setCart(user._id, []);
++    expect((await placeOrder({ paymentMethod: 'Cash on Delivery' })).error).toMatchObject({ statusCode: 400, message: 'Your cart is empty' });
++  });
++});
+diff --git a/server/tests/unit/paymentFoundation.test.js b/server/tests/unit/paymentFoundation.test.js
+new file mode 100644
+index 0000000..d693e1a
+--- /dev/null
++++ b/server/tests/unit/paymentFoundation.test.js
+@@ -0,0 +1,120 @@
++// Checks on the REAL Mongoose schemas (validation and index definitions only - no database needed)
++// and on the cart fingerprint that binds a payment to the cart it was made for.
++
++const mongoose = require('mongoose');
++const Payment = require('../../models/Payment');
++const Order = require('../../models/Order');
++const { cartFingerprint } = require('../../utils/cartFingerprint');
++
++const oid = () => new mongoose.Types.ObjectId();
++
++function validPayment(overrides = {}) {
++  return {
++    user: oid(), amount: 1000, method: 'Demo Card', status: 'Succeeded',
++    reference: 'DEMO-abc', cartHash: 'h', ...overrides
++  };
++}
++
++describe('cartFingerprint', () => {
++  const base = [
++    { product: 'p1', variant: null, quantity: 2, price: 500 },
++    { product: 'p2', variant: 'Red', quantity: 1, price: 300 }
++  ];
++
++  test('is deterministic and ignores line order', () => {
++    expect(cartFingerprint(base)).toBe(cartFingerprint([...base].reverse()));
++    expect(cartFingerprint(base)).toMatch(/^[0-9a-f]{64}$/);
++  });
++
++  test('treats ObjectId and string product ids the same', () => {
++    const id = oid();
++    expect(cartFingerprint([{ product: id, quantity: 1, price: 5 }]))
++      .toBe(cartFingerprint([{ product: String(id), quantity: 1, price: 5 }]));
++  });
++
++  test.each([
++    ['quantity', { quantity: 3 }],
++    ['price', { price: 501 }],
++    ['variant', { variant: 'Blue' }],
++    ['product', { product: 'p9' }]
++  ])('changes when a line\'s %s changes', (_what, change) => {
++    const changed = [{ ...base[0], ...change }, base[1]];
++    expect(cartFingerprint(changed)).not.toBe(cartFingerprint(base));
++  });
++
++  test('two different carts with the same total have different fingerprints', () => {
++    const a = [{ product: 'p1', quantity: 2, price: 500 }];
++    const b = [{ product: 'p2', quantity: 2, price: 500 }];
++    expect(cartFingerprint(a)).not.toBe(cartFingerprint(b));
++  });
++});
++
++describe('Payment schema', () => {
++  test('a well-formed record validates', () => {
++    expect(new Payment(validPayment()).validateSync()).toBeUndefined();
++  });
++
++  test.each(['user', 'amount', 'method', 'status', 'reference', 'cartHash'])('requires %s', field => {
++    const doc = validPayment();
++    delete doc[field];
++    expect(new Payment(doc).validateSync().errors[field]).toBeDefined();
++  });
++
++  test('rejects unknown statuses, methods and negative amounts', () => {
++    expect(new Payment(validPayment({ status: 'Paid' })).validateSync().errors.status).toBeDefined();
++    expect(new Payment(validPayment({ method: 'Cash on Delivery' })).validateSync().errors.method).toBeDefined();
++    expect(new Payment(validPayment({ amount: -1 })).validateSync().errors.amount).toBeDefined();
++  });
++
++  test('defaults mark a payment as a simulated demo payment in INR', () => {
++    const p = new Payment(validPayment());
++    expect(p).toMatchObject({ provider: 'demo', simulated: true, currency: 'INR', order: null });
++  });
++
++  test('only the demo provider exists until a real gateway is added', () => {
++    expect(new Payment(validPayment({ provider: 'razorpay' })).validateSync().errors.provider).toBeDefined();
++  });
++
++  test('has a unique index on reference', () => {
++    const entry = Payment.schema.indexes().find(([fields]) => fields.reference === 1);
++    expect(entry).toBeDefined();
++    expect(entry[1]).toMatchObject({ unique: true });
++  });
++
++  test('has no field that could hold card or UPI details', () => {
++    const paths = Object.keys(Payment.schema.paths).join(' ').toLowerCase();
++    ['card', 'cvv', 'upi', 'number', 'expiry', 'pan'].forEach(word => expect(paths).not.toContain(word));
++  });
++});
++
++describe('Order schema', () => {
++  function validOrder(overrides = {}) {
++    return {
++      orderNumber: 'SN123456', user: oid(), shippingAddress: { fullName: 'A' },
++      subtotal: 1, total: 1, paymentMethod: 'Cash on Delivery', ...overrides
++    };
++  }
++
++  test('stores the payment link, transaction id and simulated flag', () => {
++    ['payment', 'transactionId', 'paymentSimulated', 'paidAt'].forEach(path => {
++      expect(Order.schema.path(path)).toBeDefined();
++    });
++  });
++
++  test('one payment can back at most one order (unique sparse index on payment)', () => {
++    const entry = Order.schema.indexes().find(([fields]) => fields.payment === 1);
++    expect(entry).toBeDefined();
++    expect(entry[1]).toMatchObject({ unique: true, sparse: true });
++  });
++
++  test('still accepts exactly the three existing payment methods', () => {
++    ['Demo UPI', 'Demo Card', 'Cash on Delivery'].forEach(paymentMethod => {
++      expect(new Order(validOrder({ paymentMethod })).validateSync()?.errors.paymentMethod).toBeUndefined();
++    });
++    expect(new Order(validOrder({ paymentMethod: 'Razorpay' })).validateSync().errors.paymentMethod).toBeDefined();
++  });
++
++  test('a COD order validates without any payment fields', () => {
++    expect(new Order(validOrder()).validateSync()?.errors.payment).toBeUndefined();
++  });
++});
+diff --git a/server/tests/unit/paymentValidation.test.js b/server/tests/unit/paymentValidation.test.js
+index 0710f04..f61d29c 100644
+--- a/server/tests/unit/paymentValidation.test.js
++++ b/server/tests/unit/paymentValidation.test.js
+@@ -1,63 +1,199 @@
++// Tests for the DEMO payment endpoint. It is a simulator: a "Succeeded" Payment record means the
++// simulator accepted the fake details, never that real money moved. What these tests pin down is
++// that the record is created server-side, for a server-calculated amount, and holds no card data.
++
++jest.mock('../../models/Payment', () => require('./helpers/fakeModels').Payment);
++jest.mock('../../controllers/cartController', () => require('./helpers/fakeModels').cartController);
++
++const fake = require('./helpers/fakeModels');
+ const { simulatePayment } = require('../../controllers/paymentController');
+ 
+-function mockRes() {
+-  const res = {};
+-  res.status = jest.fn().mockReturnValue(res);
+-  res.json = jest.fn().mockReturnValue(res);
+-  return res;
++const GOOD_CARD = { name: 'Sneha', number: '4111 1111 1111 1111', expiry: '12/30', cvv: '123' };
++
++let user;
++let p1;
++
++beforeEach(() => {
++  jest.useFakeTimers();
++  fake.reset();
++  ({ user } = fake.seedUser());
++  p1 = fake.seedProduct({ price: 500, mrp: 600, stock: 5 });
++  fake.setCart(user._id, [{ product: p1, quantity: 2 }]); // subtotal 1000, free delivery => total 1000
++});
++
++afterEach(() => {
++  jest.useRealTimers();
++});
++
++// Runs the handler and lets the simulated 1.2s processing delay elapse.
++async function pay(body, asUser = user) {
++  const res = { statusCode: 200 };
++  res.status = jest.fn(c => { res.statusCode = c; return res; });
++  res.json = jest.fn(b => { res.body = b; return res; });
++  const next = jest.fn();
++  const pending = simulatePayment({ user: { _id: asUser._id }, body }, res, next);
++  await jest.advanceTimersByTimeAsync(1300);
++  await pending;
++  return { body: res.body, error: next.mock.calls[0]?.[0] };
+ }
+ 
+-describe('simulatePayment', () => {
+-  test('rejects an unrecognized payment method', async () => {
+-    const next = jest.fn();
+-    await simulatePayment({ body: { method: 'PayPal' } }, mockRes(), next);
+-    expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 400 }));
++describe('simulatePayment - validation (behaviour kept from before)', () => {
++  test('rejects an unrecognized payment method and records nothing', async () => {
++    const { error } = await pay({ method: 'PayPal' });
++    expect(error).toMatchObject({ statusCode: 400 });
++    expect(fake.store.payments).toHaveLength(0);
+   });
+ 
+   test('rejects Demo Card unless the number matches the fixed demo card exactly', async () => {
+-    const next = jest.fn();
+-    await simulatePayment(
+-      { body: { method: 'Demo Card', card: { name: 'Sneha', number: '4111 1111 1111 1112', expiry: '12/30', cvv: '123' } } },
+-      mockRes(),
+-      next
+-    );
+-    expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 400 }));
++    const { error } = await pay({ method: 'Demo Card', card: { ...GOOD_CARD, number: '4111 1111 1111 1112' } });
++    expect(error).toMatchObject({ statusCode: 400 });
+   });
+ 
+   test('rejects a Demo Card CVV that is not 3-4 digits', async () => {
+-    const next = jest.fn();
+-    await simulatePayment(
+-      { body: { method: 'Demo Card', card: { name: 'Sneha', number: '4111 1111 1111 1111', expiry: '12/30', cvv: '12' } } },
+-      mockRes(),
+-      next
+-    );
+-    expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 400 }));
+-  });
+-
+-  test('accepts the exact demo card number and returns a transaction id', async () => {
+-    const res = mockRes();
+-    await simulatePayment(
+-      { body: { method: 'Demo Card', card: { name: 'Sneha', number: '4111 1111 1111 1111', expiry: '12/30', cvv: '123' } } },
+-      res,
+-      jest.fn()
+-    );
+-    const payload = res.json.mock.calls[0][0];
+-    expect(payload.success).toBe(true);
+-    expect(payload.transactionId).toMatch(/^TXN/);
+-    expect(payload.status).toBe('Paid');
+-  }, 10000);
++    const { error } = await pay({ method: 'Demo Card', card: { ...GOOD_CARD, cvv: '12' } });
++    expect(error).toMatchObject({ statusCode: 400, message: 'CVV must be 3 or 4 digits' });
++  });
+ 
+   test('rejects Demo UPI without an "@" in the UPI id', async () => {
+-    const next = jest.fn();
+-    await simulatePayment({ body: { method: 'Demo UPI', upiId: 'notanupiid' } }, mockRes(), next);
+-    expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 400 }));
+-  });
+-
+-  test('Cash on Delivery needs no card/UPI details and comes back "Pending", not "Paid"', async () => {
+-    const res = mockRes();
+-    await simulatePayment({ body: { method: 'Cash on Delivery' } }, res, jest.fn());
+-    const payload = res.json.mock.calls[0][0];
+-    expect(payload.success).toBe(true);
+-    expect(payload.status).toBe('Pending');
+-  }, 10000);
++    const { error } = await pay({ method: 'Demo UPI', upiId: 'notanupiid' });
++    expect(error).toMatchObject({ statusCode: 400 });
++  });
++
++  test('Cash on Delivery needs no details, comes back "Pending", and creates no payment record', async () => {
++    const { body, error } = await pay({ method: 'Cash on Delivery' });
++    expect(error).toBeUndefined();
++    expect(body.success).toBe(true);
++    expect(body.status).toBe('Pending');
++    expect(body.transactionId).toBeUndefined();
++    expect(fake.store.payments).toHaveLength(0);
++  });
++});
++
++describe('simulatePayment - server-side payment record', () => {
++  test('a good demo card creates a Succeeded, simulated record owned by the user', async () => {
++    const { body, error } = await pay({ method: 'Demo Card', card: GOOD_CARD });
++    expect(error).toBeUndefined();
++    expect(body.success).toBe(true);
++    expect(body.simulated).toBe(true);
++    expect(body.transactionId).toMatch(/^DEMO-[0-9a-f]{24}$/);
++
++    expect(fake.store.payments).toHaveLength(1);
++    const record = fake.store.payments[0];
++    expect(record).toMatchObject({
++      user: user._id, method: 'Demo Card', status: 'Succeeded', provider: 'demo',
++      simulated: true, currency: 'INR', reference: body.transactionId, order: null
++    });
++    expect(record.cartHash).toMatch(/^[0-9a-f]{64}$/);
++    expect(record.expiresAt.getTime()).toBeGreaterThan(Date.now());
++  });
++
++  test('a good UPI id works too', async () => {
++    const { body, error } = await pay({ method: 'Demo UPI', upiId: 'sneha@upi' });
++    expect(error).toBeUndefined();
++    expect(body.transactionId).toMatch(/^DEMO-/);
++    expect(fake.store.payments[0].method).toBe('Demo UPI');
++  });
++
++  test('the amount is calculated by the server from the cart, whatever the client sends', async () => {
++    const { body } = await pay({
++      method: 'Demo Card', card: GOOD_CARD,
++      amount: 1, total: 1, currency: 'USD', status: 'Failed', user: 'someone-else', simulated: false
++    });
++    expect(body.amount).toBe(1000);
++    expect(fake.store.payments[0]).toMatchObject({
++      amount: 1000, currency: 'INR', status: 'Succeeded', user: user._id, simulated: true
++    });
++  });
++
++  test('delivery fee is included using the shared pricing rules', async () => {
++    const cheap = fake.seedProduct({ price: 200, mrp: 200, stock: 5 });
++    fake.setCart(user._id, [{ product: cheap, quantity: 1 }]); // 200 + 49 delivery
++    const { body } = await pay({ method: 'Demo UPI', upiId: 'a@upi' });
++    expect(body.amount).toBe(249);
++  });
++
++  test('an empty cart cannot be paid for', async () => {
++    fake.setCart(user._id, []);
++    const { error } = await pay({ method: 'Demo Card', card: GOOD_CARD });
++    expect(error).toMatchObject({ statusCode: 400, message: 'Your cart is empty' });
++    expect(fake.store.payments).toHaveLength(0);
++  });
++
++  test('a failed attempt is recorded as Failed with a static reason and returns no transaction id', async () => {
++    const { body, error } = await pay({ method: 'Demo Card', card: { ...GOOD_CARD, number: '4000 0000 0000 0002' } });
++    expect(body).toBeUndefined();
++    expect(error).toMatchObject({ statusCode: 400 });
++    expect(fake.store.payments).toHaveLength(1);
++    expect(fake.store.payments[0]).toMatchObject({ status: 'Failed', failureReason: 'invalid_card', amount: 1000 });
++  });
++
++  test('card numbers, CVVs and UPI ids are never stored on any payment record', async () => {
++    await pay({ method: 'Demo Card', card: GOOD_CARD });
++    await pay({ method: 'Demo Card', card: { ...GOOD_CARD, number: '4000 0000 0000 0002', cvv: '987' } });
++    await pay({ method: 'Demo UPI', upiId: 'secretperson@upi' });
++    await pay({ method: 'Demo UPI', upiId: 'nonsense-without-at' });
++    const dump = JSON.stringify(fake.store.payments);
++    ['4111', '1111', '4000', '0002', '987', 'secretperson', 'nonsense-without-at', 'Sneha'].forEach(secret => {
++      expect(dump).not.toContain(secret);
++    });
++  });
++});
++
++describe('simulatePayment - retries with the same clientRequestId', () => {
++  test('a retried payment for the same attempt returns the original payment instead of a second one', async () => {
++    const first = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'attempt-1' });
++    const second = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'attempt-1' });
++    expect(second.body.transactionId).toBe(first.body.transactionId);
++    expect(second.body.replay).toBe(true);
++    expect(fake.store.payments).toHaveLength(1);
++  });
++
++  test('after the order went through (cart now empty), a retry gets the same payment back, not an error', async () => {
++    const first = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'attempt-done' });
++    const record = fake.store.payments[0];
++    record.status = 'Consumed'; // the order was created with it
++    fake.setCart(user._id, []); // ...and that emptied the cart
++    const retry = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'attempt-done' });
++    expect(retry.error).toBeUndefined();
++    expect(retry.body.transactionId).toBe(first.body.transactionId);
++    expect(retry.body.replay).toBe(true);
++    expect(fake.store.payments).toHaveLength(1);
++  });
++
++  test('an empty cart with no earlier payment for that attempt is still rejected', async () => {
++    fake.setCart(user._id, []);
++    const { error } = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'brand-new' });
++    expect(error).toMatchObject({ statusCode: 400, message: 'Your cart is empty' });
++  });
++
++  test('without a clientRequestId every call is a new payment (no accidental sharing)', async () => {
++    const a = await pay({ method: 'Demo Card', card: GOOD_CARD });
++    const b = await pay({ method: 'Demo Card', card: GOOD_CARD });
++    expect(a.body.transactionId).not.toBe(b.body.transactionId);
++    expect(fake.store.payments).toHaveLength(2);
++  });
++
++  test('the same clientRequestId is NOT reused once the cart (and so the amount) has changed', async () => {
++    const first = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'attempt-2' });
++    fake.setCart(user._id, [{ product: p1, quantity: 3 }]);
++    const second = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'attempt-2' });
++    expect(second.body.transactionId).not.toBe(first.body.transactionId);
++    expect(second.body.amount).toBe(1500);
++  });
++
++  test('another user cannot pick up someone else\'s payment through a shared clientRequestId', async () => {
++    const { user: other } = fake.seedUser();
++    fake.setCart(other._id, [{ product: p1, quantity: 2 }]);
++    const mine = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'shared-id' });
++    const theirs = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'shared-id' }, other);
++    expect(theirs.body.transactionId).not.toBe(mine.body.transactionId);
++    expect(fake.store.payments.find(p => p.reference === theirs.body.transactionId).user).toBe(other._id);
++  });
++
++  test('an expired unused payment is not handed back; a fresh one is created', async () => {
++    const first = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'attempt-3' });
++    await jest.advanceTimersByTimeAsync(16 * 60 * 1000);
++    const second = await pay({ method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'attempt-3' });
++    expect(second.body.transactionId).not.toBe(first.body.transactionId);
++  });
+ });
+diff --git a/server/utils/cartFingerprint.js b/server/utils/cartFingerprint.js
+new file mode 100644
+index 0000000..645083a
+--- /dev/null
++++ b/server/utils/cartFingerprint.js
+@@ -0,0 +1,16 @@
++const crypto = require('crypto');
++
++// A stable hash of "what is being bought, at what price". Used to bind a payment to the exact cart
++// it was made for. Both the payment endpoint and order creation build it from database data, so the
++// two sides can only match if the cart (items, variants, quantities, unit prices) is unchanged.
++//
++// @param {Array<{ product: any, variant?: string|null, quantity: number, price: number }>} lines
++function cartFingerprint(lines) {
++  const canonical = lines
++    .map(l => `${String(l.product)}|${l.variant || ''}|${l.quantity}|${l.price}`)
++    .sort()
++    .join('\n');
++  return crypto.createHash('sha256').update(canonical).digest('hex');
++}
++
++module.exports = { cartFingerprint };
+diff --git a/server/utils/paymentConstants.js b/server/utils/paymentConstants.js
+new file mode 100644
+index 0000000..902a6a0
+--- /dev/null
++++ b/server/utils/paymentConstants.js
+@@ -0,0 +1,19 @@
++// Shared by the Payment model, payment controller and order controller so the allowed methods and
++// lifetimes are defined once. (Kept separate from the model so they can be imported without
++// loading Mongoose.)
++
++const COD_METHOD = 'Cash on Delivery';
++
++// Methods that go through the (currently simulated) online payment step and need a Payment record.
++const ONLINE_METHODS = ['Demo UPI', 'Demo Card'];
++
++const ALL_METHODS = [...ONLINE_METHODS, COD_METHOD];
++
++// Lifecycle: Succeeded -> Consumed (attached to exactly one order). Failed is terminal.
++// Consumed goes back to Succeeded only if order creation fails after the payment was claimed.
++const PAYMENT_STATUSES = ['Succeeded', 'Failed', 'Consumed'];
++
++// How long a Succeeded payment can wait to be turned into an order.
++const PAYMENT_TTL_MS = 15 * 60 * 1000;
++
++module.exports = { COD_METHOD, ONLINE_METHODS, ALL_METHODS, PAYMENT_STATUSES, PAYMENT_TTL_MS };

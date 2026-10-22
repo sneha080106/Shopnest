@@ -25,6 +25,9 @@ describeIfDb('API integration', () => {
   let request;
   let User;
   let Product;
+  let Order;
+  let Payment;
+  let Cart;
 
   beforeAll(async () => {
     process.env.MONGO_URI = TEST_URI;
@@ -35,10 +38,17 @@ describeIfDb('API integration', () => {
     app = require('../../server');
     User = require('../../models/User');
     Product = require('../../models/Product');
+    Order = require('../../models/Order');
+    Payment = require('../../models/Payment');
+    Cart = require('../../models/Cart');
+    // Make sure the unique indexes the payment checks rely on actually exist.
+    await Promise.all([Order.init(), Payment.init()]);
   });
 
   beforeEach(async () => {
-    await Promise.all([User.deleteMany({}), Product.deleteMany({})]);
+    await Promise.all([
+      User.deleteMany({}), Product.deleteMany({}), Order.deleteMany({}), Payment.deleteMany({}), Cart.deleteMany({})
+    ]);
   });
 
   afterAll(async () => {
@@ -99,6 +109,105 @@ describeIfDb('API integration', () => {
     test('404s for an unknown product slug', async () => {
       const res = await request(app).get('/api/products/does-not-exist');
       expect(res.status).toBe(404);
+    });
+  });
+
+  // NOTE: written to run against a real MongoDB (MONGO_URI_TEST). It could not be executed in the
+  // environment where it was authored (no MongoDB available), so treat the first run as unverified.
+  describe('checkout payment verification (demo payments)', () => {
+    const GOOD_CARD = { name: 'Sneha Rao', number: '4111 1111 1111 1111', expiry: '12/30', cvv: '123' };
+    let token;
+    let addressId;
+    let product;
+
+    async function api(method, url, body) {
+      const req = request(app)[method](url).set('Authorization', `Bearer ${token}`);
+      return body === undefined ? req : req.send(body);
+    }
+
+    beforeEach(async () => {
+      await request(app).post('/api/auth/register').send({
+        name: 'Sneha Rao', email: 'pay@example.com', password: 'password123', confirmPassword: 'password123'
+      });
+      token = (await request(app).post('/api/auth/login').send({ email: 'pay@example.com', password: 'password123' })).body.token;
+      const addr = await api('post', '/api/addresses', {
+        fullName: 'Sneha Rao', phone: '9999999999', houseNumber: '1', street: 'Main St', city: 'Pune', state: 'MH', pincode: '411001'
+      });
+      addressId = addr.body.addresses[0]._id;
+      product = await Product.create({
+        name: 'Widget', slug: 'widget', description: 'x', category: 'Electronics', brand: 'B',
+        price: 500, mrp: 600, images: ['x.jpg'], stock: 5
+      });
+      await api('post', '/api/cart', { productId: String(product._id), quantity: 2 }); // total 1000
+    });
+
+    test('an arbitrary transactionId cannot create a paid order', async () => {
+      const res = await api('post', '/api/orders', {
+        addressId, paymentMethod: 'Demo Card', transactionId: 'TXN-made-up', clientRequestId: 'bypass-1', paymentStatus: 'Paid'
+      });
+      expect(res.status).toBe(400);
+      expect(await Order.countDocuments()).toBe(0);
+      expect((await Product.findById(product._id)).stock).toBe(5);
+    });
+
+    test('pay then order: paid + simulated, payment linked, stock deducted once; payment cannot be reused', async () => {
+      const pay = await api('post', '/api/payment/demo', { method: 'Demo Card', card: GOOD_CARD, clientRequestId: 'ok-1' });
+      expect(pay.status).toBe(200);
+      expect(pay.body.simulated).toBe(true);
+      expect(pay.body.amount).toBe(1000);
+
+      const order = await api('post', '/api/orders', {
+        addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId, clientRequestId: 'ok-1', expectedTotal: 1000
+      });
+      expect(order.status).toBe(201);
+      expect(order.body.order).toMatchObject({ paymentStatus: 'Paid', paymentSimulated: true, transactionId: pay.body.transactionId });
+      expect((await Product.findById(product._id)).stock).toBe(3);
+      const record = await Payment.findOne({ reference: pay.body.transactionId });
+      expect(record.status).toBe('Consumed');
+      expect(String(record.order)).toBe(String(order.body.order._id));
+
+      // same attempt retried -> original order, no second deduction
+      const retry = await api('post', '/api/orders', {
+        addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId, clientRequestId: 'ok-1'
+      });
+      expect(retry.status).toBe(200);
+      expect(retry.body.replay).toBe(true);
+      expect(await Order.countDocuments()).toBe(1);
+      expect((await Product.findById(product._id)).stock).toBe(3);
+
+      // a different attempt reusing the same payment is refused
+      await api('post', '/api/cart', { productId: String(product._id), quantity: 2 });
+      const reuse = await api('post', '/api/orders', {
+        addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId, clientRequestId: 'ok-2'
+      });
+      expect(reuse.status).toBe(400);
+      expect(await Order.countDocuments()).toBe(1);
+      expect((await Product.findById(product._id)).stock).toBe(3);
+    });
+
+    test('concurrent orders with one payment produce exactly one order', async () => {
+      const pay = await api('post', '/api/payment/demo', { method: 'Demo Card', card: GOOD_CARD });
+      const body = id => ({ addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId, clientRequestId: id });
+      const results = await Promise.all([api('post', '/api/orders', body('c1')), api('post', '/api/orders', body('c2'))]);
+      expect(results.filter(r => r.status === 201)).toHaveLength(1);
+      expect(await Order.countDocuments()).toBe(1);
+      expect((await Product.findById(product._id)).stock).toBe(3);
+    });
+
+    test('changing the cart after paying is rejected', async () => {
+      const pay = await api('post', '/api/payment/demo', { method: 'Demo Card', card: GOOD_CARD });
+      await api('post', '/api/cart', { productId: String(product._id), quantity: 1 }); // now 3 items
+      const res = await api('post', '/api/orders', { addressId, paymentMethod: 'Demo Card', transactionId: pay.body.transactionId });
+      expect(res.status).toBe(409);
+      expect(await Order.countDocuments()).toBe(0);
+    });
+
+    test('Cash on Delivery still works and stays Pending', async () => {
+      const res = await api('post', '/api/orders', { addressId, paymentMethod: 'Cash on Delivery', clientRequestId: 'cod-1', paymentStatus: 'Paid' });
+      expect(res.status).toBe(201);
+      expect(res.body.order.paymentStatus).toBe('Pending');
+      expect(res.body.order.payment).toBeUndefined();
+      expect((await Product.findById(product._id)).stock).toBe(3);
     });
   });
 
