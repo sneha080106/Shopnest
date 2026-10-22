@@ -3,6 +3,7 @@ const Product = require('../models/Product');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
 const { calculateOrderTotals } = require('../utils/pricing');
+const { parseQuantity, INVALID_QUANTITY_MESSAGE } = require('../utils/quantity');
 
 async function getOrCreateCart(userId) {
   let cart = await Cart.findOne({ user: userId });
@@ -30,13 +31,16 @@ const getCart = asyncHandler(async (req, res) => {
 });
 
 const addToCart = asyncHandler(async (req, res, next) => {
-  const { productId, quantity = 1, variant = null } = req.body;
+  const { productId, quantity: rawQuantity = 1, variant = null } = req.body;
   if (!productId) return next(new AppError('productId is required', 400));
+
+  // Whole numbers only - a fractional or malformed quantity is an error, never rounded.
+  const quantity = parseQuantity(rawQuantity);
+  if (quantity === null) return next(new AppError(INVALID_QUANTITY_MESSAGE, 400));
 
   const product = await Product.findById(productId);
   if (!product || !product.isActive) return next(new AppError('Product not found', 404));
   if (product.stock < 1) return next(new AppError('This product is out of stock', 400));
-  if (quantity < 1) return next(new AppError('Quantity must be at least 1', 400));
   if (quantity > product.stock) return next(new AppError(`Only ${product.stock} left in stock`, 400));
 
   const cart = await getOrCreateCart(req.user._id);
@@ -44,7 +48,12 @@ const addToCart = asyncHandler(async (req, res, next) => {
     i => i.product.toString() === productId && i.variant === variant
   );
   if (existing) {
-    const newQty = existing.quantity + Number(quantity);
+    // An item saved before quantities were validated could be fractional; adding to it would keep
+    // it fractional, so ask the customer to set a valid quantity instead of guessing.
+    if (parseQuantity(existing.quantity) === null) {
+      return next(new AppError('The quantity of this item in your cart is invalid. Please update it from the cart page.', 400));
+    }
+    const newQty = existing.quantity + quantity;
     if (newQty > product.stock) return next(new AppError(`Only ${product.stock} left in stock`, 400));
     existing.quantity = newQty;
   } else {
@@ -55,12 +64,13 @@ const addToCart = asyncHandler(async (req, res, next) => {
 });
 
 const updateCartItem = asyncHandler(async (req, res, next) => {
-  const { quantity } = req.body;
   const cart = await getOrCreateCart(req.user._id);
   const item = cart.items.id(req.params.itemId);
   if (!item) return next(new AppError('Cart item not found', 404));
 
-  if (quantity < 1) return next(new AppError('Quantity must be at least 1', 400));
+  // Whole numbers only - a fractional or malformed quantity is an error, never rounded.
+  const quantity = parseQuantity(req.body.quantity);
+  if (quantity === null) return next(new AppError(INVALID_QUANTITY_MESSAGE, 400));
 
   const product = await Product.findById(item.product);
   if (!product) return next(new AppError('Product no longer available', 404));

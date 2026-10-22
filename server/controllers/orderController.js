@@ -7,6 +7,7 @@ const sendEmail = require('../utils/sendEmail');
 const orderEmailTemplate = require('../utils/orderEmailTemplate');
 const { calculateOrderTotals } = require('../utils/pricing');
 const { cartFingerprint } = require('../utils/cartFingerprint');
+const { hasInvalidQuantity } = require('../utils/quantity');
 const { COD_METHOD, ALL_METHODS } = require('../utils/paymentConstants');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -133,6 +134,10 @@ const createOrder = asyncHandler(async (req, res, next) => {
   const populated = await populateCart(cart);
   if (populated.items.length === 0) {
     return next(new AppError('Your cart is empty', 400));
+  }
+  // Defence for carts saved before quantities were validated: never turn a fractional quantity into an order.
+  if (hasInvalidQuantity(populated.items)) {
+    return next(new AppError('An item in your cart has an invalid quantity. Please review your cart.', 400));
   }
 
   const orderItems = populated.items.map(item => ({

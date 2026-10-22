@@ -4,6 +4,7 @@ const asyncHandler = require('../middleware/asyncHandler');
 const Payment = require('../models/Payment');
 const { getOrCreateCart, populateCart } = require('./cartController');
 const { cartFingerprint } = require('../utils/cartFingerprint');
+const { hasInvalidQuantity } = require('../utils/quantity');
 const { COD_METHOD, ALL_METHODS, PAYMENT_TTL_MS } = require('../utils/paymentConstants');
 
 // DEMO payment simulator. No real payment gateway is contacted and no money moves.
@@ -91,6 +92,9 @@ const simulatePayment = asyncHandler(async (req, res, next) => {
   const populated = await populateCart(cart);
   if (populated.items.length === 0) {
     return next(new AppError('Your cart is empty', 400));
+  }
+  if (hasInvalidQuantity(populated.items)) {
+    return next(new AppError('An item in your cart has an invalid quantity. Please review your cart.', 400));
   }
   const amount = populated.total;
   const cartHash = cartFingerprint(

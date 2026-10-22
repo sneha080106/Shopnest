@@ -139,6 +139,50 @@ const cartController = {
   }
 };
 
+// A Cart model that behaves enough like Mongoose's for the REAL controllers/cartController to run
+// against it (subdocument .id(), .deleteOne(), .populate(), push() casting quantity to a Number).
+// Backed by the same store.carts that setCart() seeds, so both styles of test can share it.
+function shapeCart(cart) {
+  const items = cart.items;
+  const defineHidden = (obj, key, value) =>
+    Object.defineProperty(obj, key, { value, enumerable: false, configurable: true, writable: true });
+
+  const attachItem = item => {
+    if (!item.deleteOne) {
+      defineHidden(item, 'deleteOne', () => { const i = items.indexOf(item); if (i >= 0) items.splice(i, 1); });
+    }
+    return item;
+  };
+  if (!items.id) {
+    defineHidden(items, 'id', id => items.find(i => String(i._id) === String(id)) || null);
+    const nativePush = Array.prototype.push.bind(items);
+    defineHidden(items, 'push', (...docs) => nativePush(...docs.map(d =>
+      attachItem({ _id: newId(), ...d, quantity: Number(d.quantity), variant: d.variant ?? null }))));
+  }
+  items.forEach(attachItem);
+  if (!cart.populate) {
+    defineHidden(cart, 'populate', async () => ({
+      items: cart.items.map(i => ({
+        _id: i._id, quantity: i.quantity, variant: i.variant ?? null,
+        product: store.products.find(p => p._id === String(i.product)) || null
+      }))
+    }));
+  }
+  return cart;
+}
+
+const Cart = {
+  findOne: async filter => {
+    const cart = store.carts.find(c => matches(c, filter));
+    return cart ? shapeCart(cart) : null;
+  },
+  create: async doc => {
+    const cart = { user: String(doc.user), items: [...(doc.items || [])], async save() { return this; } };
+    store.carts.push(cart);
+    return shapeCart(cart);
+  }
+};
+
 // ---- seeding helpers ----
 function seedProduct(overrides = {}) {
   const product = {
@@ -164,4 +208,4 @@ function setCart(userId, lines) {
   return cart;
 }
 
-module.exports = { store, hooks, reset, Product, Order, Payment, User, cartController, seedProduct, seedUser, setCart };
+module.exports = { store, hooks, reset, Product, Order, Payment, User, Cart, cartController, seedProduct, seedUser, setCart };

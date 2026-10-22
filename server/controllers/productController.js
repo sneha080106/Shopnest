@@ -2,6 +2,17 @@ const Product = require('../models/Product');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
 
+// Reads a list-style query parameter. Accepts the comma-separated form (?brand=a,b) and the
+// repeated form (?brand=a&brand=b, which Express parses into an array), and combines them.
+// Anything else (?brand[x]=y gives an object, nested arrays, ...) is rejected rather than crashing.
+function parseListParam(value, name) {
+  const values = Array.isArray(value) ? value : [value];
+  if (!values.every(v => typeof v === 'string')) {
+    throw new AppError(`Invalid ${name} filter`, 400);
+  }
+  return values.flatMap(v => v.split(',')).filter(Boolean);
+}
+
 const getProducts = asyncHandler(async (req, res) => {
   const {
     search,
@@ -22,7 +33,10 @@ const getProducts = asyncHandler(async (req, res) => {
     filter.$text = { $search: search };
   }
   if (category) filter.category = category;
-  if (brand) filter.brand = { $in: brand.split(',') };
+  if (brand !== undefined) {
+    const brands = parseListParam(brand, 'brand');
+    if (brands.length > 0) filter.brand = { $in: brands };
+  }
   if (minPrice || maxPrice) {
     filter.price = {};
     if (minPrice) filter.price.$gte = Number(minPrice);
