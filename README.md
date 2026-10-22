@@ -126,15 +126,32 @@ bugs live.
 ## Demo payment
 
 Checkout never contacts a real payment processor — this is explicit by design, not a shortcut.
+**Nothing about this flow is production payment processing.** It is a simulator, built so that a
+real gateway can later replace the simulator without changing how orders are verified.
 
 - **Demo UPI** — any fake UPI ID in the form `name@upi`
 - **Demo Card** — must use the fixed test card `4111 1111 1111 1111`, any future expiry (e.g.
   `12/30`), any 3–4 digit CVV
 - **Cash on Delivery** — no payment details required
 
-"Pay & Place Order" simulates a ~1.2 second processing delay, then returns a transaction id. No
-card number, CVV, or UPI ID is ever persisted anywhere — the payment endpoint only validates the
-input and returns a reference id; it never reaches the database. The checkout screen is clearly
+How it works:
+
+1. `POST /api/payment/demo` calculates the amount **on the server** from the user's cart (same
+   pricing code as checkout; the request cannot set an amount or a status) and stores a `Payment`
+   record: user, amount, currency, method, status, and a hash of the cart that was paid for. The
+   record is marked `simulated: true`. A failed attempt is stored as `Failed` with a static reason —
+   card numbers, CVVs and UPI IDs are never stored.
+2. It returns the record's server-issued reference as `transactionId`.
+3. `POST /api/orders` does **not** trust that value as proof of anything. It looks the reference up
+   in the `Payment` records and only accepts a payment that belongs to the same user, used the same
+   method, `Succeeded`, hasn't expired (15 minutes) or been used, and whose amount and cart hash
+   match the order being placed now. The payment is claimed atomically, so it can back at most one
+   order (a unique index on `Order.payment` backs this up). If stock can't be reserved, the claim is
+   released so the customer can retry without paying again.
+4. The order stores the payment link, the reference and `paymentSimulated: true`. `paymentStatus`
+   is set only by the server, never from the request.
+
+"Pay & Place Order" simulates a ~1.2 second processing delay. The checkout screen is clearly
 labeled **"DEMO PAYMENT — NO REAL MONEY WILL BE CHARGED."**
 
 ## Security measures
@@ -166,7 +183,7 @@ Two tiers, in `server/tests/`:
   npm test
   ```
 
-  This is 48 tests and takes a few seconds.
+  This is around 150 tests and takes a few seconds.
 
 - **`tests/integration/`** — real HTTP requests via supertest against the actual Express app,
   with a real MongoDB connection (register → login → protected route, product listing +
@@ -202,7 +219,7 @@ cd ../client && npm install
 
 ```bash
 cd server
-cp ../.env.example .env
+cp .env.example .env
 ```
 
 | Variable | Description |
