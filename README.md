@@ -247,6 +247,22 @@ about what happened.
 - **Local:** install MongoDB Community Server, run `mongod`, and use
   `mongodb://127.0.0.1:27017/shopnest`.
 
+## Database indexes (payments and orders)
+
+The payment and order models rely on unique and partial indexes (one payment per order, no duplicate
+webhook events, and so on). Declaring them in a Mongoose schema does **not** guarantee they exist in
+the database you deployed to, and a unique index cannot be built over data that already has duplicates.
+Before taking real payments, run the check against the real database:
+
+```bash
+cd server
+npm run indexes:check                                   # read-only report
+node scripts/phase1-indexes.js --apply --confirm-db=<database name>   # create what is missing
+```
+
+The script only ever creates missing indexes. It never drops one, and it refuses to build a unique index
+over duplicate data (it lists the duplicates instead). Run it again after every deploy that changes a model.
+
 ## Seeding the database
 
 ```bash

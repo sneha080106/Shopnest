@@ -71,8 +71,8 @@ describe('Payment schema', () => {
     expect(p).toMatchObject({ provider: 'demo', simulated: true, currency: 'INR', order: null });
   });
 
-  test('only the demo provider exists until a real gateway is added', () => {
-    expect(new Payment(validPayment({ provider: 'razorpay' })).validateSync().errors.provider).toBeDefined();
+  test('only the known providers (demo, razorpay) are accepted', () => {
+    expect(new Payment(validPayment({ provider: 'stripe' })).validateSync().errors.provider).toBeDefined();
   });
 
   test('has a unique index on reference', () => {
@@ -107,11 +107,11 @@ describe('Order schema', () => {
     expect(entry[1]).toMatchObject({ unique: true, sparse: true });
   });
 
-  test('still accepts exactly the three existing payment methods', () => {
-    ['Demo UPI', 'Demo Card', 'Cash on Delivery'].forEach(paymentMethod => {
+  test('still accepts the three existing payment methods, now plus Razorpay, and nothing else', () => {
+    ['Demo UPI', 'Demo Card', 'Cash on Delivery', 'Razorpay'].forEach(paymentMethod => {
       expect(new Order(validOrder({ paymentMethod })).validateSync()?.errors.paymentMethod).toBeUndefined();
     });
-    expect(new Order(validOrder({ paymentMethod: 'Razorpay' })).validateSync().errors.paymentMethod).toBeDefined();
+    expect(new Order(validOrder({ paymentMethod: 'Stripe' })).validateSync().errors.paymentMethod).toBeDefined();
   });
 
   test('a COD order validates without any payment fields', () => {
