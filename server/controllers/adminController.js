@@ -3,6 +3,7 @@ const Order = require('../models/Order');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
 const slugify = require('slugify');
+const { stringParam, intParam } = require('../utils/requestParams');
 
 // Shared by create and update so both paths reject the same bad input. `partial` skips the
 // required-field check for updates, where a request might only be changing stock, for example.
@@ -31,13 +32,14 @@ function validateProductFields(body, { partial = false } = {}) {
 }
 
 const adminGetProducts = asyncHandler(async (req, res) => {
-  const { page = 1, limit = 20 } = req.query;
-  const skip = (Number(page) - 1) * Number(limit);
+  const page = Math.max(1, intParam(req.query.page, 1));
+  const limit = Math.max(1, intParam(req.query.limit, 20));
+  const skip = (page - 1) * limit;
   const [products, total] = await Promise.all([
-    Product.find({}).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
+    Product.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit),
     Product.countDocuments({})
   ]);
-  res.json({ success: true, products, pagination: { page: Number(page), total, totalPages: Math.ceil(total / limit) || 1 } });
+  res.json({ success: true, products, pagination: { page, total, totalPages: Math.ceil(total / limit) || 1 } });
 });
 
 const adminCreateProduct = asyncHandler(async (req, res, next) => {
@@ -73,14 +75,17 @@ const adminDeleteProduct = asyncHandler(async (req, res, next) => {
 });
 
 const adminGetOrders = asyncHandler(async (req, res) => {
-  const { page = 1, limit = 20, status } = req.query;
+  const page = Math.max(1, intParam(req.query.page, 1));
+  const limit = Math.max(1, intParam(req.query.limit, 20));
+  // Must be plain text: ?status[$ne]=x would otherwise reach the query as an operator.
+  const status = stringParam(req.query.status, 'status');
   const filter = status ? { orderStatus: status } : {};
-  const skip = (Number(page) - 1) * Number(limit);
+  const skip = (page - 1) * limit;
   const [orders, total] = await Promise.all([
-    Order.find(filter).populate('user', 'name email').sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
+    Order.find(filter).populate('user', 'name email').sort({ createdAt: -1 }).skip(skip).limit(limit),
     Order.countDocuments(filter)
   ]);
-  res.json({ success: true, orders, pagination: { page: Number(page), total, totalPages: Math.ceil(total / limit) || 1 } });
+  res.json({ success: true, orders, pagination: { page, total, totalPages: Math.ceil(total / limit) || 1 } });
 });
 
 const adminUpdateOrderStatus = asyncHandler(async (req, res, next) => {

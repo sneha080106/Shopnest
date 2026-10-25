@@ -9,6 +9,7 @@ function validateAddress(body) {
     if (!body[field] || !String(body[field]).trim()) {
       return `${field} is required`;
     }
+    if (typeof body[field] !== 'string') return `${field} must be text`;
   }
   if (!/^\d{10}$/.test(body.phone)) return 'Phone number must be 10 digits';
   if (!/^\d{6}$/.test(body.pincode)) return 'Pincode must be 6 digits';

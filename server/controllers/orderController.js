@@ -113,6 +113,14 @@ const createOrder = asyncHandler(async (req, res, next) => {
   if (!addressId || !paymentMethod) {
     return next(new AppError('Address and payment method are required', 400));
   }
+  // Plain text only. In particular clientRequestId is used as a lookup filter, so { "$ne": null }
+  // must never reach it (it would "find" some other order and replay it).
+  if (typeof addressId !== 'string' || typeof paymentMethod !== 'string') {
+    return next(new AppError('Invalid input', 400));
+  }
+  if (clientRequestId !== undefined && (typeof clientRequestId !== 'string' || clientRequestId.length > 100)) {
+    return next(new AppError('Invalid clientRequestId', 400));
+  }
   if (!ALL_METHODS.includes(paymentMethod)) {
     return next(new AppError('Invalid payment method', 400));
   }

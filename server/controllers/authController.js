@@ -4,6 +4,7 @@ const generateToken = require('../utils/generateToken');
 const sendEmail = require('../utils/sendEmail');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
+const { isString } = require('../utils/requestParams');
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -12,6 +13,10 @@ const register = asyncHandler(async (req, res, next) => {
 
   if (!name || !email || !password || !confirmPassword) {
     return next(new AppError('Please fill in all required fields', 400));
+  }
+  // Every field must be plain text (a JSON body can carry objects/arrays, which must never reach a query).
+  if (![name, email, password, confirmPassword].every(isString) || (phone !== undefined && !isString(phone))) {
+    return next(new AppError('Invalid input', 400));
   }
   if (!EMAIL_REGEX.test(email)) {
     return next(new AppError('Please enter a valid email address', 400));
@@ -42,6 +47,9 @@ const login = asyncHandler(async (req, res, next) => {
   if (!email || !password) {
     return next(new AppError('Please provide email and password', 400));
   }
+  if (!isString(email) || !isString(password)) {
+    return next(new AppError('Invalid input', 400));
+  }
 
   const user = await User.findOne({ email: email.toLowerCase() }).select('+password');
   if (!user || !(await user.comparePassword(password))) {
@@ -62,6 +70,7 @@ const getMe = asyncHandler(async (req, res) => {
 const forgotPassword = asyncHandler(async (req, res, next) => {
   const { email } = req.body;
   if (!email) return next(new AppError('Please provide your email', 400));
+  if (!isString(email)) return next(new AppError('Invalid input', 400));
 
   const genericResponse = {
     success: true,
@@ -102,6 +111,9 @@ const resetPassword = asyncHandler(async (req, res, next) => {
 
   if (!password || !confirmPassword) {
     return next(new AppError('Please enter and confirm your new password', 400));
+  }
+  if (!isString(password) || !isString(confirmPassword)) {
+    return next(new AppError('Invalid input', 400));
   }
   if (password.length < 6) {
     return next(new AppError('Password must be at least 6 characters', 400));

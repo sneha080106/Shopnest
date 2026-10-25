@@ -33,6 +33,9 @@ const getCart = asyncHandler(async (req, res) => {
 const addToCart = asyncHandler(async (req, res, next) => {
   const { productId, quantity: rawQuantity = 1, variant = null } = req.body;
   if (!productId) return next(new AppError('productId is required', 400));
+  // Plain text only: { "$ne": null } as a productId would otherwise be run as a query operator.
+  if (typeof productId !== 'string') return next(new AppError('productId is invalid', 400));
+  if (variant !== null && typeof variant !== 'string') return next(new AppError('variant is invalid', 400));
 
   // Whole numbers only - a fractional or malformed quantity is an error, never rounded.
   const quantity = parseQuantity(rawQuantity);

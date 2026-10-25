@@ -1,6 +1,7 @@
 const Product = require('../models/Product');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
+const { stringParam, intParam } = require('../utils/requestParams');
 
 // Reads a list-style query parameter. Accepts the comma-separated form (?brand=a,b) and the
 // repeated form (?brand=a&brand=b, which Express parses into an array), and combines them.
@@ -27,12 +28,17 @@ const getProducts = asyncHandler(async (req, res) => {
     limit = 20
   } = req.query;
 
+  // Text filters must be plain strings: ?category[$ne]=x or ?search[$regex]=.* would otherwise reach
+  // the query as operators.
+  const searchText = stringParam(search, 'search');
+  const categoryName = stringParam(category, 'category');
+
   const filter = { isActive: true };
 
-  if (search) {
-    filter.$text = { $search: search };
+  if (searchText) {
+    filter.$text = { $search: searchText };
   }
-  if (category) filter.category = category;
+  if (categoryName) filter.category = categoryName;
   if (brand !== undefined) {
     const brands = parseListParam(brand, 'brand');
     if (brands.length > 0) filter.brand = { $in: brands };
@@ -50,13 +56,13 @@ const getProducts = asyncHandler(async (req, res) => {
   else if (sort === 'price_desc') sortOption = { price: -1 };
   else if (sort === 'rating') sortOption = { rating: -1 };
   else if (sort === 'newest') sortOption = { createdAt: -1 };
-  else if (sort === 'relevance' && search) sortOption = { score: { $meta: 'textScore' } };
+  else if (sort === 'relevance' && searchText) sortOption = { score: { $meta: 'textScore' } };
 
-  const pageNum = Math.max(1, Number(page));
-  const limitNum = Math.min(48, Math.max(1, Number(limit)));
+  const pageNum = Math.max(1, intParam(page, 1));
+  const limitNum = Math.min(48, Math.max(1, intParam(limit, 20)));
   const skip = (pageNum - 1) * limitNum;
 
-  const projection = search ? { score: { $meta: 'textScore' } } : {};
+  const projection = searchText ? { score: { $meta: 'textScore' } } : {};
 
   const [products, total] = await Promise.all([
     Product.find(filter, projection).sort(sortOption).skip(skip).limit(limitNum),
