@@ -11,7 +11,8 @@
     "seed:destroy": "node seed/seed.js -d",
     "test": "jest tests/unit",
     "test:integration": "jest tests/integration --runInBand",
-    "test:all": "jest --runInBand"
+    "test:all": "jest --runInBand",
+    "indexes:check": "node scripts/phase1-indexes.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
