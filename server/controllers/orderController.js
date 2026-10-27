@@ -10,6 +10,8 @@ const { cartFingerprint } = require('../utils/cartFingerprint');
 const { hasInvalidQuantity } = require('../utils/quantity');
 const { COD_METHOD, ALL_METHODS } = require('../utils/paymentConstants');
 const AppError = require('../utils/AppError');
+const { customerCanCancel } = require('../utils/orderTransitions');
+const { cancelOrder: cancelOrderAndRestock } = require('../utils/orderCancellation');
 const asyncHandler = require('../middleware/asyncHandler');
 
 function generateOrderNumber() {
@@ -297,7 +299,25 @@ const getOrderById = asyncHandler(async (req, res, next) => {
   if (!order.user.equals(req.user._id) && req.user.role !== 'admin') {
     return next(new AppError('Not authorized to view this order', 403));
   }
-  res.json({ success: true, order });
+  // canCancel tells the UI whether to offer the Cancel button (the server re-checks on cancel).
+  res.json({ success: true, order: { ...order.toObject(), canCancel: customerCanCancel(order) } });
 });
 
-module.exports = { createOrder, getMyOrders, getOrderById };
+// A customer cancels their own order (only up to Packed). Restocks the items and, for a paid demo
+// order, marks the payment Refunded. Repeating the request is safe.
+const cancelMyOrder = asyncHandler(async (req, res, next) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) return next(new AppError('Order not found', 404));
+  if (String(order.user) !== String(req.user._id)) {
+    return next(new AppError('Not authorized to cancel this order', 403));
+  }
+  const result = await cancelOrderAndRestock(order, 'customer');
+  res.json({
+    success: true,
+    order: { ...result.order.toObject(), canCancel: false },
+    refunded: result.refunded,
+    replay: result.replay
+  });
+});
+
+module.exports = { createOrder, getMyOrders, getOrderById, cancelMyOrder };

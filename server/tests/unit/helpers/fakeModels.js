@@ -35,6 +35,8 @@ function matches(doc, filter) {
         const num = x => (x instanceof Date ? x.getTime() : x);
         if (op === '$gte') return num(value) >= num(operand);
         if (op === '$gt') return value != null && num(value) > num(operand);
+        if (op === '$in') return operand.some(x => String(x) === String(value));
+        if (op === '$ne') return operand === null ? value != null : String(value) !== String(operand);
         throw new Error(`fakeModels: unsupported operator ${op}`);
       });
     }
@@ -78,6 +80,19 @@ function dupError(keyPattern) {
 
 const Order = {
   findOne: async filter => store.orders.find(d => matches(d, filter)) || null,
+  findById: async id => store.orders.find(d => d._id === String(id)) || null,
+  // Atomic like MongoDB's single-document operations (no await between the match and the write).
+  findOneAndUpdate: async (filter, update) => {
+    const doc = store.orders.find(d => matches(d, filter));
+    if (!doc) return null;
+    applyUpdate(doc, update);
+    return doc;
+  },
+  updateOne: async (filter, update) => {
+    const doc = store.orders.find(d => matches(d, filter));
+    if (doc) applyUpdate(doc, update);
+    return { matchedCount: doc ? 1 : 0 };
+  },
   create: async doc => {
     if (hooks.failOrderCreate) throw hooks.failOrderCreate;
     if (doc.clientRequestId && store.orders.some(o => o.clientRequestId === doc.clientRequestId)) {
@@ -86,7 +101,11 @@ const Order = {
     if (doc.payment && store.orders.some(o => String(o.payment) === String(doc.payment))) {
       throw dupError({ payment: 1 });
     }
-    const order = { _id: newId(), emailSent: false, ...doc, async save() { return this; } };
+    const order = {
+      _id: newId(), emailSent: false, stockReleased: false, ...doc,
+      async save() { return this; },
+      toObject() { const { save, toObject, ...rest } = this; return { ...rest }; }
+    };
     store.orders.push(order);
     return order;
   }

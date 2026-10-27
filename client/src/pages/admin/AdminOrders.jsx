@@ -4,7 +4,7 @@ import { useToast } from '../../context/ToastContext';
 import { inr } from '../../components/PriceBlock';
 import Loader from '../../components/Loader';
 
-const STATUSES = ['Placed', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'];
+const STATUSES = ['Awaiting Payment', 'Placed', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Expired'];
 
 export default function AdminOrders() {
   const { showToast } = useToast();
@@ -59,9 +59,12 @@ export default function AdminOrders() {
                 <Td>{inr(o.total)}</Td>
                 <Td>{o.paymentMethod}<div style={{ fontSize: 11, color: 'var(--color-muted)' }}>{o.paymentStatus}</div></Td>
                 <Td>
+                  {/* Only the current status and the steps the server will accept are offered. */}
                   <select value={o.orderStatus} onChange={e => updateStatus(o._id, e.target.value)}
+                    disabled={!o.nextStatuses || o.nextStatuses.length === 0}
+                    aria-label={`Status of order ${o.orderNumber}`}
                     style={{ padding: '6px 8px', border: '1px solid var(--color-border)', borderRadius: 4, fontSize: 12 }}>
-                    {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+                    {[o.orderStatus, ...(o.nextStatuses || [])].map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </Td>
               </tr>

@@ -4,6 +4,8 @@ const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
 const slugify = require('slugify');
 const { stringParam, intParam } = require('../utils/requestParams');
+const { ADMIN_SETTABLE, CANCELLED, canAdminTransition, adminNextStatuses } = require('../utils/orderTransitions');
+const { cancelOrder } = require('../utils/orderCancellation');
 
 // Shared by create and update so both paths reject the same bad input. `partial` skips the
 // required-field check for updates, where a request might only be changing stock, for example.
@@ -85,20 +87,41 @@ const adminGetOrders = asyncHandler(async (req, res) => {
     Order.find(filter).populate('user', 'name email').sort({ createdAt: -1 }).skip(skip).limit(limit),
     Order.countDocuments(filter)
   ]);
-  res.json({ success: true, orders, pagination: { page, total, totalPages: Math.ceil(total / limit) || 1 } });
+  res.json({ success: true, orders: orders.map(o => ({ ...o.toObject(), nextStatuses: adminNextStatuses(o.orderStatus) })), pagination: { page, total, totalPages: Math.ceil(total / limit) || 1 } });
 });
 
 const adminUpdateOrderStatus = asyncHandler(async (req, res, next) => {
   const { orderStatus } = req.body;
-  const validStatuses = ['Placed', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'];
-  if (!validStatuses.includes(orderStatus)) {
+  if (typeof orderStatus !== 'string' || !ADMIN_SETTABLE.includes(orderStatus)) {
     return next(new AppError('Invalid order status', 400));
   }
   const order = await Order.findById(req.params.id);
   if (!order) return next(new AppError('Order not found', 404));
-  order.orderStatus = orderStatus;
-  await order.save();
-  res.json({ success: true, order });
+
+  // Asking for the status it already has (a double click) is not an error and changes nothing.
+  if (order.orderStatus === orderStatus && orderStatus !== CANCELLED) {
+    return res.json({ success: true, order });
+  }
+
+  if (orderStatus === CANCELLED) {
+    // Cancelling also gives the stock back and marks a paid demo payment Refunded.
+    const result = await cancelOrder(order, 'admin');
+    return res.json({ success: true, order: result.order, refunded: result.refunded });
+  }
+
+  if (!canAdminTransition(order.orderStatus, orderStatus)) {
+    return next(new AppError(`An order cannot be moved from ${order.orderStatus} to ${orderStatus}`, 400));
+  }
+
+  // Compare-and-set: only change it if it still has the status we just checked, so a customer
+  // cancelling (or another admin) at the same moment cannot be silently overwritten.
+  const updated = await Order.findOneAndUpdate(
+    { _id: order._id, orderStatus: order.orderStatus },
+    { $set: { orderStatus } },
+    { new: true }
+  );
+  if (!updated) return next(new AppError('The order was just updated. Please refresh and try again.', 409));
+  res.json({ success: true, order: updated });
 });
 
 module.exports = {

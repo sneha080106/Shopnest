@@ -86,7 +86,10 @@ const orderSchema = new mongoose.Schema({
     }
   },
   emailSent: { type: Boolean, default: false },
-  estimatedDelivery: { type: Date }
+  estimatedDelivery: { type: Date },
+  // Set when the order is cancelled (by the customer or an admin).
+  cancelledAt: { type: Date },
+  cancelledBy: { type: String, enum: ['customer', 'admin'] }
 }, { timestamps: true });
 
 // Supports "my orders, newest first" (getMyOrders) and admin's per-status listing.

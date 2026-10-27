@@ -123,6 +123,21 @@ bugs live.
    if SMTP isn't configured or fails, so a broken mail server can't turn a successful order into
    a failed one. The order success page tells the user honestly whether the email went out.
 
+## Order status rules and cancellation
+
+- Statuses only move forward: Placed → Confirmed → Packed → Shipped → Out for Delivery → Delivered.
+  `Delivered` and `Cancelled` are final. An admin can cancel any order before it is Delivered.
+- A customer can cancel their own order up to **Packed** (`PUT /api/orders/:id/cancel`). After that only
+  an admin can cancel it.
+- Cancelling returns the items to stock **exactly once** (a `stockReleased` flag is claimed atomically
+  before any stock is added, so retries and double clicks cannot restock twice) and marks a paid demo
+  payment `Refunded`. If giving stock back fails part-way, the partial change is undone and repeating the
+  cancel finishes the job.
+- Status changes are compare-and-set: if a customer cancels at the same moment an admin ships, one of
+  them wins and the other gets a "refresh and try again" (409) instead of silently overwriting.
+- An order paid through a real gateway cannot be cancelled by this code until gateway refunds exist.
+- Not done yet: Cash on Delivery orders are never marked `Paid` when delivered.
+
 ## Demo payment
 
 Checkout never contacts a real payment processor — this is explicit by design, not a shortcut.

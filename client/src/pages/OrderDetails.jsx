@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import api from '../services/api';
+import api, { getErrorMessage } from '../services/api';
+import { useToast } from '../context/ToastContext';
+import ConfirmDialog from '../components/ConfirmDialog';
 import { inr } from '../components/PriceBlock';
 import ProductImage from '../components/ProductImage';
 import Loader from '../components/Loader';
@@ -10,11 +12,33 @@ const PROGRESS_STEPS = ['Placed', 'Confirmed', 'Packed', 'Shipped', 'Delivered']
 
 export default function OrderDetails() {
   const { id } = useParams();
+  const { showToast } = useToast();
   const [order, setOrder] = useState(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
     api.get(`/orders/${id}`).then(res => setOrder(res.data.order));
   }, [id]);
+
+  async function cancelOrder() {
+    if (cancelling) return;
+    setCancelling(true);
+    try {
+      const res = await api.put(`/orders/${id}/cancel`);
+      setOrder(res.data.order);
+      showToast(res.data.refunded
+        ? 'Order cancelled. The payment has been marked as refunded.'
+        : 'Order cancelled.');
+    } catch (err) {
+      showToast(getErrorMessage(err), 'error');
+      // The order may have moved on (e.g. just shipped): reload so the page shows the truth.
+      api.get(`/orders/${id}`).then(res => setOrder(res.data.order)).catch(() => {});
+    } finally {
+      setCancelling(false);
+      setConfirmOpen(false);
+    }
+  }
 
   if (!order) return <Loader label="Loading order…" />;
 
@@ -27,6 +51,12 @@ export default function OrderDetails() {
         <h1 style={{ fontSize: 20 }}>Order #{order.orderNumber}</h1>
         <StatusBadge status={order.orderStatus} />
       </div>
+
+      {order.canCancel && (
+        <div style={{ marginBottom: 20 }}>
+          <button className="btn btn-ghost btn-sm" onClick={() => setConfirmOpen(true)} disabled={cancelling}>Cancel order</button>
+        </div>
+      )}
 
       {!isCancelled && (
         <div className="card" style={{ padding: 20, marginBottom: 20 }}>
@@ -92,6 +122,17 @@ export default function OrderDetails() {
           <SummaryLine label="Total" value={inr(order.total)} bold />
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmOpen}
+        title="Cancel this order?"
+        description={order.paymentStatus === 'Paid'
+          ? 'The items go back into stock and the payment will be marked as refunded. This cannot be undone.'
+          : 'The items go back into stock. This cannot be undone.'}
+        confirmLabel={cancelling ? 'Cancelling…' : 'Yes, cancel order'}
+        onConfirm={cancelOrder}
+        onCancel={() => setConfirmOpen(false)}
+      />
     </div>
   );
 }
