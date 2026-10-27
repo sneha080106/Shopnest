@@ -97,9 +97,14 @@ const forgotPassword = asyncHandler(async (req, res, next) => {
   });
 
   if (!emailResult.sent) {
-    // The token still exists in the DB (so a dev testing locally can still complete the flow
-    // via server logs), but we don't want to claim an email went out when it didn't.
-    console.warn(`[auth] Password reset email not sent for ${user.email}: ${emailResult.error}. Reset URL (dev only): ${resetUrl}`);
+    // The token still exists in the DB, but we don't claim an email went out when it didn't.
+    // The reset link is a credential (anyone who can read it can take over the account), so it is
+    // only ever logged in local development - never in production or any other environment - and
+    // the log names the user by id rather than by email address.
+    console.warn(`[auth] Password reset email not sent for user ${user._id}: ${emailResult.error}.`);
+    if (process.env.NODE_ENV === 'development') {
+      console.warn(`[auth] Reset URL (local development only): ${resetUrl}`);
+    }
   }
 
   res.json(genericResponse);

@@ -168,7 +168,7 @@ labeled **"DEMO PAYMENT — NO REAL MONEY WILL BE CHARGED."**
 - Server-side price/stock verification and atomic stock updates (see above)
 - The app refuses to start if `JWT_SECRET` or `MONGO_URI` is missing, rather than starting in a
   broken state and failing confusingly on the first request
-- No sensitive identifiers (card numbers, CVV, SMTP passwords) ever get logged or stored
+- No sensitive identifiers (card numbers, CVV, SMTP passwords) ever get logged or stored. The password-reset link is only logged in local development (`NODE_ENV=development`), and logged email addresses are masked
 
 ## Testing
 
@@ -227,6 +227,7 @@ cp .env.example .env
 | `PORT` | Port the API runs on (default `5000`) |
 | `NODE_ENV` | `development`, `production`, or `test` |
 | `CLIENT_URL` | Frontend origin — used for CORS **and** for building the password-reset link sent by email |
+| `TRUST_PROXY` | Number of reverse proxies in front of the API (usually `1` on Render/Railway/Nginx). Leave blank locally. Needed so rate limits apply per user instead of to everyone behind the proxy at once. Must be a number, never `true` |
 | `MONGO_URI` | Your MongoDB connection string. **Required** — the app refuses to start without it |
 | `JWT_SECRET` | A long random string used to sign auth tokens. **Required** — the app refuses to start without it |
 | `JWT_EXPIRES_IN` | Token lifetime (default `7d`) |

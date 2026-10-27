@@ -6,6 +6,7 @@ const morgan = require('morgan');
 const mongoose = require('mongoose');
 const connectDB = require('./config/db');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
+const { parseTrustProxy } = require('./utils/trustProxy');
 
 const authRoutes = require('./routes/authRoutes');
 const productRoutes = require('./routes/productRoutes');
@@ -25,6 +26,18 @@ if (missingEnvVars.length > 0 && process.env.NODE_ENV !== 'test') {
 }
 
 const app = express();
+
+// How many reverse proxies sit in front of this app (see utils/trustProxy.js). Without it, behind a
+// proxy, all users share one rate-limit bucket; with the wrong value, clients could fake their IP.
+let trustProxy;
+try {
+  trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
+} catch (err) {
+  if (process.env.NODE_ENV === 'test') throw err;
+  console.error(err.message);
+  process.exit(1);
+}
+app.set('trust proxy', trustProxy);
 
 // helmet's default CSP is tuned for serving HTML from the same origin; this API only ever
 // serves JSON to a separate frontend origin, so the real cross-origin policy is the CORS
@@ -67,6 +80,9 @@ const PORT = process.env.PORT || 5000;
 let server;
 
 async function start() {
+  if (process.env.NODE_ENV === 'production' && trustProxy === false) {
+    console.warn('[config] TRUST_PROXY is not set. If this app runs behind a reverse proxy (most hosts), set TRUST_PROXY=1 so rate limits apply per user instead of to everyone at once.');
+  }
   await connectDB();
   server = app.listen(PORT, () => {
     console.log(`ShopNest server running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);

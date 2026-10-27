@@ -1,4 +1,5 @@
 const nodemailer = require('nodemailer');
+const { maskEmail } = require('./maskEmail');
 
 let transporter = null;
 let emailConfigured = false;
@@ -29,7 +30,7 @@ transporter = initTransporter();
  */
 async function sendEmail({ to, subject, html }) {
   if (!emailConfigured || !transporter) {
-    console.warn(`[email] Skipped sending "${subject}" to ${to} (email not configured).`);
+    console.warn(`[email] Skipped sending "${subject}" to ${maskEmail(to)} (email not configured).`);
     return { sent: false, error: 'Email not configured' };
   }
   try {
