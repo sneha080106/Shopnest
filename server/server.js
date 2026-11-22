@@ -7,6 +7,7 @@ const mongoose = require('mongoose');
 const connectDB = require('./config/db');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
 const { parseTrustProxy } = require('./utils/trustProxy');
+const { registerProcessHandlers } = require('./utils/logError');
 
 const authRoutes = require('./routes/authRoutes');
 const productRoutes = require('./routes/productRoutes');
@@ -80,6 +81,7 @@ const PORT = process.env.PORT || 5000;
 let server;
 
 async function start() {
+  registerProcessHandlers(); // log (safely) and exit on a crash so the host restarts a clean process
   if (process.env.NODE_ENV === 'production' && trustProxy === false) {
     console.warn('[config] TRUST_PROXY is not set. If this app runs behind a reverse proxy (most hosts), set TRUST_PROXY=1 so rate limits apply per user instead of to everyone at once.');
   }
