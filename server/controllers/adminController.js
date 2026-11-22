@@ -7,6 +7,36 @@ const { stringParam, intParam } = require('../utils/requestParams');
 const { ADMIN_SETTABLE, CANCELLED, canAdminTransition, adminNextStatuses } = require('../utils/orderTransitions');
 const { cancelOrder } = require('../utils/orderCancellation');
 
+const isPlainObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+// The ONLY product fields an admin request may set. Everything else is server-controlled:
+//   slug            generated on create, never changed afterwards (it is the product's URL)
+//   rating, reviewCount   owned by the reviews feature; an admin must not be able to fake them
+//   discountPercent       always computed from price and MRP
+//   _id, createdAt, updatedAt, __v and any unknown field
+// Copying the whole request body onto the product ("mass assignment") would let a request overwrite
+// any of those, so the body is checked against this list instead.
+const PRODUCT_WRITABLE_FIELDS = [
+  'name', 'description', 'shortDescription', 'category', 'brand', 'price', 'mrp', 'images', 'stock',
+  'specifications', 'highlights', 'variants', 'isActive'
+];
+
+// Returns { data } with just the writable fields, or { error } naming the fields that may not be set.
+// Only field NAMES are echoed back, never their values.
+function pickProductFields(body) {
+  if (!isPlainObject(body)) return { error: 'Request body must be a JSON object' };
+  const rejected = Object.keys(body).filter(key => !PRODUCT_WRITABLE_FIELDS.includes(key));
+  if (rejected.length > 0) {
+    const shown = rejected.slice(0, 5).map(key => key.slice(0, 40)).join(', ');
+    return { error: `These fields cannot be set: ${shown}${rejected.length > 5 ? ', …' : ''}` };
+  }
+  const data = {};
+  for (const key of PRODUCT_WRITABLE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(body, key)) data[key] = body[key];
+  }
+  return { data };
+}
+
 // Shared by create and update so both paths reject the same bad input. `partial` skips the
 // required-field check for updates, where a request might only be changing stock, for example.
 function validateProductFields(body, { partial = false } = {}) {
@@ -30,6 +60,23 @@ function validateProductFields(body, { partial = false } = {}) {
   if (body.images !== undefined && (!Array.isArray(body.images) || body.images.some(url => typeof url !== 'string' || !url.trim()))) {
     return 'Images must be a list of non-empty URLs';
   }
+  // Text fields must really be text (a JSON body can carry objects/arrays for any field).
+  for (const field of ['name', 'description', 'shortDescription', 'category', 'brand']) {
+    if (body[field] !== undefined && typeof body[field] !== 'string') return `${field} must be text`;
+  }
+  if (body.isActive !== undefined && typeof body.isActive !== 'boolean') return 'isActive must be true or false';
+  if (body.highlights !== undefined && (!Array.isArray(body.highlights) || body.highlights.some(h => typeof h !== 'string'))) {
+    return 'Highlights must be a list of text';
+  }
+  if (body.specifications !== undefined && (!Array.isArray(body.specifications)
+    || body.specifications.some(s => !isPlainObject(s) || typeof s.key !== 'string' || typeof s.value !== 'string'))) {
+    return 'Specifications must be a list of { key, value } text pairs';
+  }
+  if (body.variants !== undefined && (!Array.isArray(body.variants)
+    || body.variants.some(v => !isPlainObject(v) || typeof v.label !== 'string'
+      || !Array.isArray(v.options) || v.options.some(o => typeof o !== 'string')))) {
+    return 'Variants must be a list of { label, options } where options is a list of text';
+  }
   return null;
 }
 
@@ -45,7 +92,9 @@ const adminGetProducts = asyncHandler(async (req, res) => {
 });
 
 const adminCreateProduct = asyncHandler(async (req, res, next) => {
-  const body = req.body;
+  const picked = pickProductFields(req.body);
+  if (picked.error) return next(new AppError(picked.error, 400));
+  const body = picked.data;
   const validationError = validateProductFields(body);
   if (validationError) return next(new AppError(validationError, 400));
   if (body.mrp === undefined || body.price === undefined) {
@@ -58,12 +107,16 @@ const adminCreateProduct = asyncHandler(async (req, res, next) => {
 });
 
 const adminUpdateProduct = asyncHandler(async (req, res, next) => {
-  const validationError = validateProductFields(req.body, { partial: true });
+  const picked = pickProductFields(req.body);
+  if (picked.error) return next(new AppError(picked.error, 400));
+  const validationError = validateProductFields(picked.data, { partial: true });
   if (validationError) return next(new AppError(validationError, 400));
 
   const product = await Product.findById(req.params.id);
   if (!product) return next(new AppError('Product not found', 404));
-  Object.assign(product, req.body);
+  product.set(picked.data);
+  // A partial update (only price, or only MRP) must still leave price <= MRP overall.
+  if (product.price > product.mrp) return next(new AppError('Price cannot be higher than MRP', 400));
   await product.save();
   res.json({ success: true, product });
 });
@@ -131,5 +184,7 @@ module.exports = {
   adminDeleteProduct,
   adminGetOrders,
   adminUpdateOrderStatus,
-  validateProductFields
+  validateProductFields,
+  pickProductFields,
+  PRODUCT_WRITABLE_FIELDS
 };

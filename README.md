@@ -184,6 +184,7 @@ labeled **"DEMO PAYMENT — NO REAL MONEY WILL BE CHARGED."**
 - The app refuses to start if `JWT_SECRET` or `MONGO_URI` is missing, rather than starting in a
   broken state and failing confusingly on the first request
 - No sensitive identifiers (card numbers, CVV, SMTP passwords) ever get logged or stored. The password-reset link is only logged in local development (`NODE_ENV=development`), and logged email addresses are masked
+- Admin product create/update accept only an allowlist of fields (name, description, category, brand, price, MRP, stock, images, specifications, highlights, variants, isActive). Slug, rating, review count, discount percent and anything unknown are refused, and a partial update can never leave the price above the MRP
 
 ## Testing
 
