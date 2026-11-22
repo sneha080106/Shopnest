@@ -6,6 +6,7 @@ const slugify = require('slugify');
 const { stringParam, intParam } = require('../utils/requestParams');
 const { ADMIN_SETTABLE, CANCELLED, canAdminTransition, adminNextStatuses } = require('../utils/orderTransitions');
 const { cancelOrder } = require('../utils/orderCancellation');
+const { COD_METHOD } = require('../utils/paymentConstants');
 
 const isPlainObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -168,11 +169,19 @@ const adminUpdateOrderStatus = asyncHandler(async (req, res, next) => {
 
   // Compare-and-set: only change it if it still has the status we just checked, so a customer
   // cancelling (or another admin) at the same moment cannot be silently overwritten.
-  const updated = await Order.findOneAndUpdate(
-    { _id: order._id, orderStatus: order.orderStatus },
-    { $set: { orderStatus } },
-    { new: true }
-  );
+  const filter = { _id: order._id, orderStatus: order.orderStatus };
+  const changes = { orderStatus };
+
+  // Cash on Delivery: the cash is collected when the order is delivered, so delivering it settles
+  // the payment in the SAME atomic update (never "Delivered" without "Paid", or the reverse).
+  // Orders that were already paid (demo/online) are left exactly as they are.
+  if (orderStatus === 'Delivered' && order.paymentMethod === COD_METHOD && order.paymentStatus === 'Pending') {
+    filter.paymentStatus = 'Pending';
+    changes.paymentStatus = 'Paid';
+    changes.paidAt = new Date();
+  }
+
+  const updated = await Order.findOneAndUpdate(filter, { $set: changes }, { new: true });
   if (!updated) return next(new AppError('The order was just updated. Please refresh and try again.', 409));
   res.json({ success: true, order: updated });
 });
