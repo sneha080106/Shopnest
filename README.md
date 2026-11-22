@@ -136,7 +136,7 @@ bugs live.
 - Status changes are compare-and-set: if a customer cancels at the same moment an admin ships, one of
   them wins and the other gets a "refresh and try again" (409) instead of silently overwriting.
 - An order paid through a real gateway cannot be cancelled by this code until gateway refunds exist.
-- Not done yet: Cash on Delivery orders are never marked `Paid` when delivered.
+- A Cash on Delivery order is marked `Paid` (with a paid date) at the same moment it is marked `Delivered`, in one atomic update. Cancelled COD orders stay `Pending`. COD orders delivered *before* this change keep their old `Pending` status and need a one-off database fix.
 
 ## Demo payment
 
