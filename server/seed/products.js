@@ -1,9 +1,7 @@
 // 41 seed products across 9 categories, priced in INR.
-// Images use picsum.photos with a stable per-product seed so URLs never 404.
+// Images are real photos of each kind of product, mapped by name in ./productImages.js.
 
-function img(seed, n = 1) {
-  return Array.from({ length: n }, (_, i) => `https://picsum.photos/seed/shopnest-${seed}-${i}/700/700`);
-}
+const { imagesFor } = require('./productImages');
 
 const products = [
   // Electronics
@@ -193,10 +191,10 @@ const products = [
     specifications: [{ key: 'Material', value: 'Aluminium' }] }
 ];
 
-const seedProducts = products.map((p, idx) => ({
+const seedProducts = products.map(p => ({
   ...p,
   slug: undefined, // computed in seed.js via slugify, so uniqueness is guaranteed even if a name repeats
-  images: img(`${p.brand}-${idx}`.toLowerCase().replace(/[^a-z0-9]+/g, '-'), 3),
+  images: imagesFor(p.name),
   rating: Math.round((3.5 + Math.random() * 1.5) * 10) / 10,
   reviewCount: Math.floor(20 + Math.random() * 480)
 }));
