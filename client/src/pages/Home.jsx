@@ -5,14 +5,14 @@ import ProductCard from '../components/ProductCard';
 import { GridSkeleton } from '../components/Loader';
 
 const CATEGORY_TILES = [
-  { name: 'Electronics', img: 'https://picsum.photos/seed/shopnest-cat-electronics/300/300' },
-  { name: 'Mobiles', img: 'https://picsum.photos/seed/shopnest-cat-mobiles/300/300' },
-  { name: 'Fashion', img: 'https://picsum.photos/seed/shopnest-cat-fashion/300/300' },
-  { name: 'Home & Kitchen', img: 'https://picsum.photos/seed/shopnest-cat-home/300/300' },
-  { name: 'Beauty', img: 'https://picsum.photos/seed/shopnest-cat-beauty/300/300' },
-  { name: 'Books', img: 'https://picsum.photos/seed/shopnest-cat-books/300/300' },
-  { name: 'Sports', img: 'https://picsum.photos/seed/shopnest-cat-sports/300/300' },
-  { name: 'Accessories', img: 'https://picsum.photos/seed/shopnest-cat-accessories/300/300' }
+  { name: 'Electronics', img: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?auto=format&fit=crop&w=300&q=80' },
+  { name: 'Mobiles', img: 'https://images.unsplash.com/photo-1592890288564-76628a30a657?auto=format&fit=crop&w=300&q=80' },
+  { name: 'Fashion', img: 'https://images.unsplash.com/photo-1573612664822-d7d347da7b80?auto=format&fit=crop&w=300&q=80' },
+  { name: 'Home & Kitchen', img: 'https://images.unsplash.com/photo-1556910602-38f53e68e15d?auto=format&fit=crop&w=300&q=80' },
+  { name: 'Beauty', img: 'https://images.unsplash.com/photo-1552046122-03184de85e08?auto=format&fit=crop&w=300&q=80' },
+  { name: 'Books', img: 'https://images.unsplash.com/photo-1695773719016-3d033a4aac07?auto=format&fit=crop&w=300&q=80' },
+  { name: 'Sports', img: 'https://images.unsplash.com/photo-1646239646963-b0b9be56d6b5?auto=format&fit=crop&w=300&q=80' },
+  { name: 'Accessories', img: 'https://images.unsplash.com/photo-1518665750801-883c188a660d?auto=format&fit=crop&w=300&q=80' }
 ];
 
 function useRecentlyViewed() {
@@ -71,9 +71,9 @@ export default function Home() {
             <Link to="/products" className="btn btn-accent">Shop Now</Link>
           </div>
           <img
-            src="https://picsum.photos/seed/shopnest-hero/520/340"
+            src="https://images.unsplash.com/photo-1576072446584-4955dfe17b86?auto=format&fit=crop&w=900&h=600&q=80"
             alt="Featured products collage"
-            style={{ flex: '1 1 320px', maxWidth: 480, borderRadius: 8 }}
+            style={{ flex: '1 1 320px', maxWidth: 480, borderRadius: 8, objectFit: 'cover' }}
           />
         </div>
       </section>
