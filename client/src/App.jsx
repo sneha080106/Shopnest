@@ -22,6 +22,7 @@ import NotFound from './pages/NotFound';
 import AdminLayout from './pages/admin/AdminLayout';
 import AdminProducts from './pages/admin/AdminProducts';
 import AdminOrders from './pages/admin/AdminOrders';
+import AdminUsers from './pages/admin/AdminUsers';
 
 export default function App() {
   return (
@@ -47,6 +48,7 @@ export default function App() {
           <Route index element={<Navigate to="products" replace />} />
           <Route path="products" element={<AdminProducts />} />
           <Route path="orders" element={<AdminOrders />} />
+          <Route path="users" element={<AdminUsers />} />
         </Route>
 
         <Route path="*" element={<NotFound />} />
