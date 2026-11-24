@@ -5,7 +5,8 @@ const {
   adminUpdateProduct,
   adminDeleteProduct,
   adminGetOrders,
-  adminUpdateOrderStatus
+  adminUpdateOrderStatus,
+  adminGetUsers
 } = require('../controllers/adminController');
 const { protect, adminOnly } = require('../middleware/auth');
 const router = express.Router();
@@ -19,5 +20,7 @@ router.delete('/products/:id', adminDeleteProduct);
 
 router.get('/orders', adminGetOrders);
 router.put('/orders/:id/status', adminUpdateOrderStatus);
+
+router.get('/users', adminGetUsers);
 
 module.exports = router;
