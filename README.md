@@ -187,6 +187,7 @@ labeled **"DEMO PAYMENT — NO REAL MONEY WILL BE CHARGED."**
 - Admin product create/update accept only an allowlist of fields (name, description, category, brand, price, MRP, stock, images, specifications, highlights, variants, isActive). Slug, rating, review count, discount percent and anything unknown are refused, and a partial update can never leave the price above the MRP
 - In production, server errors (5xx) and process crashes are logged as one JSON line each: time, method, route pattern (e.g. `/api/auth/reset-password/:token`, never the real URL), status, and a scrubbed error message/stack. Request bodies, headers, query strings and params are never logged, and passwords, tokens, emails and database credentials are redacted from messages. The user sees a generic message plus a short `errorId` that matches the log line, so a support report can be traced
 - Customers can edit only their name and phone (`PUT /api/auth/me`). Email, role, password and every other field are refused with a `400`, so a profile request can never promote an account to admin
+- The admin Users page (`GET /api/admin/users`) is read-only and admin-only. It returns only name, email, phone, role, join date and order count (never password hashes or reset tokens), caps page size at 100, and treats the search box as plain text, so characters like `.*` can't act as a pattern
 
 ## Testing
 
