@@ -64,6 +64,50 @@ const getMe = asyncHandler(async (req, res) => {
   res.json({ success: true, user: req.user.toSafeObject() });
 });
 
+// Only these fields can be changed through the profile endpoint. Email, role and password are
+// deliberately NOT here: copying a request body onto the user would let anyone make themselves an
+// admin, and changing email/password needs its own verification step.
+const PROFILE_WRITABLE_FIELDS = ['name', 'phone'];
+
+const updateMe = asyncHandler(async (req, res, next) => {
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return next(new AppError('Request body must be a JSON object', 400));
+  }
+
+  const rejected = Object.keys(body).filter(key => !PROFILE_WRITABLE_FIELDS.includes(key));
+  if (rejected.length > 0) {
+    // Only field names are echoed back, never values.
+    const shown = rejected.slice(0, 5).map(key => key.slice(0, 40)).join(', ');
+    return next(new AppError(`These fields cannot be changed here: ${shown}${rejected.length > 5 ? ', …' : ''}`, 400));
+  }
+  if (!PROFILE_WRITABLE_FIELDS.some(key => Object.prototype.hasOwnProperty.call(body, key))) {
+    return next(new AppError('Nothing to update', 400));
+  }
+
+  const { name, phone } = body;
+  if (name !== undefined) {
+    if (!isString(name)) return next(new AppError('Invalid input', 400));
+    const trimmed = name.trim();
+    if (trimmed.length < 2 || trimmed.length > 60) {
+      return next(new AppError('Name must be between 2 and 60 characters', 400));
+    }
+  }
+  if (phone !== undefined) {
+    if (!isString(phone)) return next(new AppError('Invalid input', 400));
+    // An empty string removes the saved number.
+    if (phone !== '' && !/^\d{10}$/.test(phone)) {
+      return next(new AppError('Phone number must be 10 digits', 400));
+    }
+  }
+
+  if (name !== undefined) req.user.name = name.trim();
+  if (phone !== undefined) req.user.phone = phone === '' ? undefined : phone;
+  await req.user.save();
+
+  res.json({ success: true, user: req.user.toSafeObject() });
+});
+
 // Always responds the same way whether or not the email is registered, so the endpoint can't
 // be used to check which emails have accounts. The actual token only ever leaves the server
 // inside the email itself — the response never contains it, even in development.
@@ -146,4 +190,4 @@ const resetPassword = asyncHandler(async (req, res, next) => {
   res.json({ success: true, message: 'Password updated. You are now logged in.', token: authToken, user: user.toSafeObject() });
 });
 
-module.exports = { register, login, getMe, forgotPassword, resetPassword };
+module.exports = { register, login, getMe, updateMe, forgotPassword, resetPassword, PROFILE_WRITABLE_FIELDS };
