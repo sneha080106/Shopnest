@@ -53,12 +53,22 @@ export function AuthProvider({ children }) {
     setUser(nextUser);
   }
 
+  async function updateProfile(payload) {
+    try {
+      const res = await api.put('/auth/me', payload);
+      setUser(res.data.user);
+      return { success: true };
+    } catch (err) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }
+
   function updateUserAddresses(addresses) {
     setUser(prev => (prev ? { ...prev, addresses } : prev));
   }
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, register, logout, setSession, updateUserAddresses }}>
+    <AuthContext.Provider value={{ user, loading, login, register, logout, setSession, updateProfile, updateUserAddresses }}>
       {children}
     </AuthContext.Provider>
   );
