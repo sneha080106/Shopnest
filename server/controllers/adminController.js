@@ -1,5 +1,6 @@
 const Product = require('../models/Product');
 const Order = require('../models/Order');
+const User = require('../models/User');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
 const slugify = require('slugify');
@@ -144,6 +145,49 @@ const adminGetOrders = asyncHandler(async (req, res) => {
   res.json({ success: true, orders: orders.map(o => ({ ...o.toObject(), nextStatuses: adminNextStatuses(o.orderStatus) })), pagination: { page, total, totalPages: Math.ceil(total / limit) || 1 } });
 });
 
+// Read-only customer list for the admin panel. Only name, email, phone, role and join date are
+// returned (never a password hash or reset token), and nothing here can change an account.
+const USER_LIST_FIELDS = 'name email phone role createdAt';
+const MAX_USERS_PER_PAGE = 100;
+const escapeRegex = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const adminGetUsers = asyncHandler(async (req, res, next) => {
+  const page = Math.max(1, intParam(req.query.page, 1));
+  const limit = Math.min(MAX_USERS_PER_PAGE, Math.max(1, intParam(req.query.limit, 20)));
+  // Both must be plain text: ?role[$ne]=x or ?search[$regex]=.* would otherwise reach the query as operators.
+  const role = stringParam(req.query.role, 'role');
+  const search = stringParam(req.query.search, 'search');
+
+  const filter = {};
+  if (role) {
+    if (!['customer', 'admin'].includes(role)) return next(new AppError('Invalid role filter', 400));
+    filter.role = role;
+  }
+  if (search && search.trim()) {
+    // Typed text is matched literally ("a.b" must not behave as a pattern), and capped in length.
+    const pattern = new RegExp(escapeRegex(search.trim().slice(0, 100)), 'i');
+    filter.$or = [{ name: pattern }, { email: pattern }];
+  }
+
+  const skip = (page - 1) * limit;
+  const [users, total] = await Promise.all([
+    User.find(filter).select(USER_LIST_FIELDS).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    User.countDocuments(filter)
+  ]);
+
+  // One grouped query for the whole page instead of one count per user.
+  const counts = users.length
+    ? await Order.aggregate([{ $match: { user: { $in: users.map(u => u._id) } } }, { $group: { _id: '$user', count: { $sum: 1 } } }])
+    : [];
+  const orderCounts = new Map(counts.map(c => [String(c._id), c.count]));
+
+  res.json({
+    success: true,
+    users: users.map(u => ({ ...u.toObject(), orderCount: orderCounts.get(String(u._id)) || 0 })),
+    pagination: { page, total, totalPages: Math.ceil(total / limit) || 1 }
+  });
+});
+
 const adminUpdateOrderStatus = asyncHandler(async (req, res, next) => {
   const { orderStatus } = req.body;
   if (typeof orderStatus !== 'string' || !ADMIN_SETTABLE.includes(orderStatus)) {
@@ -193,6 +237,8 @@ module.exports = {
   adminDeleteProduct,
   adminGetOrders,
   adminUpdateOrderStatus,
+  adminGetUsers,
+  USER_LIST_FIELDS,
   validateProductFields,
   pickProductFields,
   PRODUCT_WRITABLE_FIELDS
