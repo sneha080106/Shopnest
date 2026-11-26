@@ -1,9 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import api from '../services/api';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useCart } from '../context/CartContext';
 
-const CATEGORIES = ['Electronics', 'Mobiles', 'Laptops', 'Fashion', 'Home & Kitchen', 'Beauty', 'Books', 'Sports', 'Accessories'];
+// Shown until (or if) the live list from the server loads.
+const DEFAULT_CATEGORIES = ['Electronics', 'Mobiles', 'Laptops', 'Fashion', 'Home & Kitchen', 'Beauty', 'Books', 'Sports', 'Accessories'];
 
 export default function Header() {
   const { user, logout } = useAuth();
@@ -11,6 +13,13 @@ export default function Header() {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
+  const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
+
+  useEffect(() => {
+    api.get('/categories')
+      .then(res => { if (res.data.categories.length) setCategories(res.data.categories); })
+      .catch(() => {});
+  }, []);
   const itemCount = cart.items.reduce((s, i) => s + i.quantity, 0);
 
   function handleSearch(e) {
@@ -78,7 +87,7 @@ export default function Header() {
 
       <div style={{ background: '#fff', borderBottom: '1px solid var(--color-border)' }} className="category-bar">
         <div className="container" style={{ display: 'flex', gap: 22, padding: '10px 20px', overflowX: 'auto' }}>
-          {CATEGORIES.map(cat => (
+          {categories.map(cat => (
             <Link key={cat} to={`/products?category=${encodeURIComponent(cat)}`} style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-ink-soft)', whiteSpace: 'nowrap' }}>
               {cat}
             </Link>
