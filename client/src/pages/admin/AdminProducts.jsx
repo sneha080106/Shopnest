@@ -17,13 +17,17 @@ export default function AdminProducts() {
   const [deleteId, setDeleteId] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [categoryNames, setCategoryNames] = useState([]);
 
   async function load() {
     const res = await api.get('/admin/products?limit=100');
     setProducts(res.data.products);
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    api.get('/categories').then(res => setCategoryNames(res.data.categories)).catch(() => {});
+  }, []);
 
   function openCreate() {
     setEditing(null);
@@ -105,7 +109,12 @@ export default function AdminProducts() {
             <div className="field-row">
               <div className="field">
                 <label>Category</label>
-                <input required value={form.category} onChange={e => setForm({ ...form, category: e.target.value })} />
+                <select required value={form.category} onChange={e => setForm({ ...form, category: e.target.value })}>
+                  <option value="">Select a category</option>
+                  {/* A product saved under an older name still shows it until changed. */}
+                  {form.category && !categoryNames.includes(form.category) && <option value={form.category}>{form.category}</option>}
+                  {categoryNames.map(name => <option key={name} value={name}>{name}</option>)}
+                </select>
               </div>
               <div className="field">
                 <label>Brand</label>
