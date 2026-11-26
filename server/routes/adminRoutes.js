@@ -8,6 +8,12 @@ const {
   adminUpdateOrderStatus,
   adminGetUsers
 } = require('../controllers/adminController');
+const {
+  adminGetCategories,
+  adminCreateCategory,
+  adminRenameCategory,
+  adminDeleteCategory
+} = require('../controllers/categoryController');
 const { protect, adminOnly } = require('../middleware/auth');
 const router = express.Router();
 
@@ -22,5 +28,10 @@ router.get('/orders', adminGetOrders);
 router.put('/orders/:id/status', adminUpdateOrderStatus);
 
 router.get('/users', adminGetUsers);
+
+router.get('/categories', adminGetCategories);
+router.post('/categories', adminCreateCategory);
+router.put('/categories/:id', adminRenameCategory);
+router.delete('/categories/:id', adminDeleteCategory);
 
 module.exports = router;
