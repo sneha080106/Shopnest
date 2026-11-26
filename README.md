@@ -188,6 +188,7 @@ labeled **"DEMO PAYMENT — NO REAL MONEY WILL BE CHARGED."**
 - In production, server errors (5xx) and process crashes are logged as one JSON line each: time, method, route pattern (e.g. `/api/auth/reset-password/:token`, never the real URL), status, and a scrubbed error message/stack. Request bodies, headers, query strings and params are never logged, and passwords, tokens, emails and database credentials are redacted from messages. The user sees a generic message plus a short `errorId` that matches the log line, so a support report can be traced
 - Customers can edit only their name and phone (`PUT /api/auth/me`). Email, role, password and every other field are refused with a `400`, so a profile request can never promote an account to admin
 - The admin Users page (`GET /api/admin/users`) is read-only and admin-only. It returns only name, email, phone, role, join date and order count (never password hashes or reset tokens), caps page size at 100, and treats the search box as plain text, so characters like `.*` can't act as a pattern
+- Admins manage product categories from the admin Categories tab (add, rename, delete). Renaming updates every product in that category, a category that still has products cannot be deleted, and products can only be saved under a listed category (stored under its official spelling). Shops that already have products get their categories filled in automatically the first time the list is opened
 
 ## Testing
 
