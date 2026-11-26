@@ -1,6 +1,7 @@
 const Product = require('../models/Product');
 const Order = require('../models/Order');
 const User = require('../models/User');
+const { resolveCategoryName } = require('./categoryController');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../middleware/asyncHandler');
 const slugify = require('slugify');
@@ -103,6 +104,11 @@ const adminCreateProduct = asyncHandler(async (req, res, next) => {
     return next(new AppError('price and mrp are required', 400));
   }
 
+  // The category must be one the shop lists (saved under its official spelling).
+  const categoryName = await resolveCategoryName(body.category);
+  if (!categoryName) return next(new AppError('Unknown category. Pick one from the list or add it under Categories.', 400));
+  body.category = categoryName;
+
   const slug = slugify(`${body.name}-${Date.now()}`, { lower: true, strict: true });
   const product = await Product.create({ ...body, slug });
   res.status(201).json({ success: true, product });
@@ -113,6 +119,12 @@ const adminUpdateProduct = asyncHandler(async (req, res, next) => {
   if (picked.error) return next(new AppError(picked.error, 400));
   const validationError = validateProductFields(picked.data, { partial: true });
   if (validationError) return next(new AppError(validationError, 400));
+
+  if (picked.data.category !== undefined) {
+    const categoryName = await resolveCategoryName(picked.data.category);
+    if (!categoryName) return next(new AppError('Unknown category. Pick one from the list or add it under Categories.', 400));
+    picked.data.category = categoryName;
+  }
 
   const product = await Product.findById(req.params.id);
   if (!product) return next(new AppError('Product not found', 404));
