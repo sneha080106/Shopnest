@@ -132,7 +132,15 @@ describe('simulatePayment - server-side payment record', () => {
     await pay({ method: 'Demo Card', card: { ...GOOD_CARD, number: '4000 0000 0000 0002', cvv: '987' } });
     await pay({ method: 'Demo UPI', upiId: 'secretperson@upi' });
     await pay({ method: 'Demo UPI', upiId: 'nonsense-without-at' });
-    const dump = JSON.stringify(fake.store.payments);
+    // Server-generated random/time fields can contain any short digit run by chance (e.g. "987" inside
+    // a random hex reference), which made this test fail about one run in twenty. So these fields are
+    // checked by exact FORMAT (they cannot carry user input) and left out of the substring search.
+    const GENERATED = ['_id', 'reference', 'cartHash', 'createdAt', 'updatedAt', 'expiresAt'];
+    fake.store.payments.forEach(p => {
+      if (p.reference !== undefined) expect(p.reference).toMatch(/^DEMO-[0-9a-f]{24}$/);
+      if (p.cartHash !== undefined) expect(p.cartHash).toMatch(/^[0-9a-f]{64}$/);
+    });
+    const dump = JSON.stringify(fake.store.payments, (key, value) => (GENERATED.includes(key) ? undefined : value));
     ['4111', '1111', '4000', '0002', '987', 'secretperson', 'nonsense-without-at', 'Sneha'].forEach(secret => {
       expect(dump).not.toContain(secret);
     });
