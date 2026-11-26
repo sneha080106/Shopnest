@@ -8,6 +8,7 @@ const Order = require('../models/Order');
 const Cart = require('../models/Cart');
 const Review = require('../models/Review');
 const seedProducts = require('./products');
+const Category = require('../models/Category');
 const { resolveAdminPassword, AdminSeedConfigError } = require('../utils/adminSeedConfig');
 
 async function run() {
@@ -48,6 +49,14 @@ async function run() {
 
   await Product.insertMany(withSlugs);
   console.log(`Seeded ${withSlugs.length} products.`);
+
+  // The categories the seed products use (in the order they first appear), so the admin
+  // Categories page and the product form start with them. Existing ones are left alone.
+  const categoryNames = [...new Set(seedProducts.map(p => p.category))];
+  for (const name of categoryNames) {
+    if (!(await Category.findOne({ key: name.toLowerCase() }))) await Category.create({ name });
+  }
+  console.log(`Ensured ${categoryNames.length} categories.`);
 
   const adminEmail = process.env.ADMIN_EMAIL || 'admin@shopnest.example.com';
   const existingAdmin = await User.findOne({ email: adminEmail });
