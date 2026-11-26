@@ -5,9 +5,10 @@ export default function AdminLayout() {
   return (
     <div className="container page-wrap">
       <h1 style={{ fontSize: 20, marginBottom: 6 }}>Admin Dashboard</h1>
-      <p style={{ fontSize: 13, color: 'var(--color-muted)', marginBottom: 20 }}>Manage products, orders and users.</p>
+      <p style={{ fontSize: 13, color: 'var(--color-muted)', marginBottom: 20 }}>Manage products, categories, orders and users.</p>
       <div style={{ display: 'flex', gap: 10, marginBottom: 24, borderBottom: '1px solid var(--color-border)' }}>
         <AdminTab to="/admin/products" label="Products" />
+        <AdminTab to="/admin/categories" label="Categories" />
         <AdminTab to="/admin/orders" label="Orders" />
         <AdminTab to="/admin/users" label="Users" />
       </div>
