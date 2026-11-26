@@ -3,6 +3,11 @@
 
 jest.mock('../../models/Product', () => ({ create: jest.fn(), findById: jest.fn() }));
 jest.mock('../../models/Order', () => ({}));
+// The shop's category list: only "Electronics" and "Books" exist. Lookups are by lower-case key.
+jest.mock('../../models/Category', () => ({
+  countDocuments: jest.fn(async () => 2),
+  findOne: jest.fn(async ({ key }) => ({ electronics: { name: 'Electronics' }, books: { name: 'Books' } }[key] || null))
+}));
 
 const Product = require('../../models/Product');
 const { adminCreateProduct, adminUpdateProduct, pickProductFields, PRODUCT_WRITABLE_FIELDS, validateProductFields } = require('../../controllers/adminController');
